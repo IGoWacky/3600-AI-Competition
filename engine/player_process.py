@@ -51,7 +51,10 @@ def apply_seccomp():
 
     import prctl
 
-    prctl.set_ptracer(None)
+    try:
+        prctl.set_ptracer(None)
+    except OSError:
+        pass  # PR_SET_PTRACER unavailable without Yama LSM — non-fatal
     prctl.set_no_new_privs(True)
     ctx = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
     # filesystem
@@ -75,7 +78,8 @@ def apply_seccomp():
     # ctx.add_rule(seccomp.KILL, 'link')
     # ctx.add_rule(seccomp.KILL, 'creat')
     ctx.add_rule(seccomp.KILL, "truncate")
-    ctx.add_rule(seccomp.KILL, "ftruncate")
+    # ftruncate is allowed — JAX/XLA uses it for shared memory buffer allocation.
+    # Bots only have write access to their own player directory, so this is safe.
     # ctx.add_rule(seccomp.KILL, 'pwrite64')
 
     # #time
@@ -85,10 +89,14 @@ def apply_seccomp():
     ctx.add_rule(seccomp.KILL, "settimeofday")
 
     # #network
-    ctx.add_rule(seccomp.KILL, "socket")
-    ctx.add_rule(seccomp.KILL, "bind")
+    # Block AF_INET (2) and AF_INET6 (10) sockets to prevent network access,
+    # but allow AF_UNIX (1) which JAX/XLA needs for local IPC.
+    ctx.add_rule(seccomp.KILL, "socket", seccomp.Arg(0, seccomp.EQ, 2))   # AF_INET
+    ctx.add_rule(seccomp.KILL, "socket", seccomp.Arg(0, seccomp.EQ, 10))  # AF_INET6
+    # bind/connect can't be filtered by address family at seccomp level
+    # (arg 0 is the fd, not the family); leave them allowed since socket()
+    # creation is already blocked for AF_INET/AF_INET6 above.
     ctx.add_rule(seccomp.KILL, "accept")
-    ctx.add_rule(seccomp.KILL, "connect")
     ctx.add_rule(seccomp.KILL, "listen")
     ctx.add_rule(seccomp.KILL, "setsockopt")
     ctx.add_rule(seccomp.KILL, "getsockopt")
@@ -213,6 +221,33 @@ def run_player_process(
         resource.setrlimit(
             resource.RLIMIT_RSS, (limit_bytes, limit_bytes)
         )  # only allow current process to run
+
+        # Pre-import heavy libraries before seccomp so their initialization
+        # syscalls (AF_UNIX sockets, shared memory, etc.) happen outside the
+        # sandbox. Any subsequent import in a bot is a free sys.modules cache hit.
+        for _mod in ("jax", "jax.numpy", "torch", "numpy"):
+            try:
+                __import__(_mod)
+            except ImportError:
+                pass
+
+        # JAX/XLA and PyTorch initialize their runtimes lazily on the first
+        # computation, not on import. That initialization calls setsockopt/
+        # sendmsg/recvmsg on internal Unix sockets — all blocked by seccomp.
+        # Force both runtimes to fully initialize here, before the sandbox.
+        try:
+            import jax.numpy as _jnp
+            _x = _jnp.zeros((4, 4)) @ _jnp.zeros((4, 4))
+            _x.block_until_ready()
+            del _jnp, _x
+        except Exception:
+            pass
+        try:
+            import torch as _torch
+            _x = _torch.zeros(4, 4) @ _torch.zeros(4, 4)
+            del _torch, _x
+        except Exception:
+            pass
 
         drop_priveliges(user_name, group_name)
         apply_seccomp()

@@ -2,6 +2,7 @@ import os
 import pathlib
 import sys
 import time
+import multiprocessing
 
 from board_utils import get_history_json
 from gameplay import play_game
@@ -52,4 +53,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn", force=True)
     main()

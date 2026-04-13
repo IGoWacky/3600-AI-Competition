@@ -1,7 +1,7 @@
 import random
 
 from game.board import Board
-from game.enums import Cell, MoveType, WinReason, BOARD_SIZE
+from game.enums import Cell, MoveType, WinReason, BOARD_SIZE, ALLOWED_TIME, MAX_TURNS_PER_PLAYER
 from game.rat import Rat
 import numpy as np
 
@@ -101,17 +101,53 @@ def get_history_dict(board: Board, rat_position_history, spawn_a, spawn_b, errlo
         - Move history and game metadata
     """
     board_hist = board.history
+    a_pos = [spawn_a]
+    b_pos = [spawn_b]
+    
+    for turn_index, pos in enumerate(board_hist.pos):
+        if turn_index % 2 == 0:
+            # Player A's turn
+            a_pos.append(pos)
+            b_pos.append(b_pos[-1]) # Player B stays where they were
+        else:
+            # Player B's turn
+            a_pos.append(a_pos[-1]) # Player A stays where they were
+            b_pos.append(pos)
+
     history_dict = {
-        "pos": board_hist.pos,
-        "left_behind_enums": board_hist.left_behind_enums,
-        "a_points": board_hist.a_points,
-        "b_points": board_hist.b_points,
-        "a_turns_left": board_hist.a_turns_left,
-        "b_turns_left": board_hist.b_turns_left,
-        "a_time_left": board_hist.a_time_left,
-        "b_time_left": board_hist.b_time_left,
-        "rat_caught": board_hist.rat_caught,
+        "a_pos": a_pos,
+        "b_pos": b_pos,
+        "left_behind_enums": [MoveType.PLAIN] + board_hist.left_behind_enums,
+        "a_points": [0] + board_hist.a_points,
+        "b_points": [0] + board_hist.b_points,
+        "a_turns_left": [MAX_TURNS_PER_PLAYER] + board_hist.a_turns_left,
+        "b_turns_left": [MAX_TURNS_PER_PLAYER] + board_hist.b_turns_left,
+        "a_time_left": [ALLOWED_TIME] + board_hist.a_time_left,
+        "b_time_left": [ALLOWED_TIME] + board_hist.b_time_left,
+        "rat_caught": [False] + board_hist.rat_caught,
     }
+
+    new_carpets = [[]]
+    for i in range(1, len(history_dict["left_behind_enums"])):
+        move_type = history_dict["left_behind_enums"][i]
+        new_carpet = []
+        
+        if move_type == MoveType.CARPET:
+            is_player_a = (i % 2 != 0) 
+            
+            last_pos = history_dict["a_pos"][i-1] if is_player_a else history_dict["b_pos"][i-1]
+            next_pos = history_dict["a_pos"][i] if is_player_a else history_dict["b_pos"][i]
+
+            min_x, max_x = min(last_pos[0], next_pos[0]), max(last_pos[0], next_pos[0])
+            min_y, max_y = min(last_pos[1], next_pos[1]), max(last_pos[1], next_pos[1])
+
+            for x in range(min_x, max_x + 1):
+                for y in range(min_y, max_y + 1):
+                    if (x, y) != last_pos:
+                        new_carpet.append((x, y))
+                    
+        new_carpets.append(new_carpet)
+    history_dict["new_carpets"] = new_carpets
 
     # Convert MoveType enums to strings
     left_behind = []
@@ -130,19 +166,22 @@ def get_history_dict(board: Board, rat_position_history, spawn_a, spawn_b, errlo
     history_dict["left_behind"] = left_behind
     history_dict.pop("left_behind_enums", None)
 
+    # Note: do not add initial spawn position. gameplay.py does that already
+    history_dict["rat_position_history"] = rat_position_history
+    
     # Add metadata
     history_dict["errlog_a"] = errlog_a
     history_dict["errlog_b"] = errlog_b
-    history_dict["start_time"] = board.time_to_play
-    history_dict["start_moves"] = board.MAX_TURNS
     history_dict["turn_count"] = board.turn_count
     history_dict["result"] = board.winner
     history_dict["reason"] = WinReason(board.win_reason).name
 
-    history_dict["trapdoors"] = rat_position_history
-    
-    history_dict["spawn_a"] = spawn_a
-    history_dict["spawn_b"] = spawn_b
+    blocked_cells = []
+    for y in range(BOARD_SIZE):
+        for x in range(BOARD_SIZE):
+            if board.get_cell((x, y)) == Cell.BLOCKED:
+                blocked_cells.append((x, y))
+    history_dict["blocked_positions"] = blocked_cells
 
     return history_dict
 
