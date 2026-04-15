@@ -9,7 +9,7 @@ from game.enums import MoveType, Cell
 
 
 # ===========================================================================
-# Constants (from assignment spec)
+# Constants
 # ===========================================================================
 
 BOARD_SIZE = 8
@@ -29,9 +29,18 @@ DIST_OFFSETS = {-1: 0.12, 0: 0.70, 1: 0.12, 2: 0.06}
 # Points for carpeting a run of length n
 CARPET_SCORE = {1: -1, 2: 2, 3: 4, 4: 6, 5: 10, 6: 15, 7: 21}
 
-# Search EV = 6p - 2.  Search when EV > 0  (i.e. p > 1/3).
-# OLD value was 1.0 (requiring p > 0.5 — almost never triggered correctly).
-SEARCH_EV_THRESHOLD = 0.0
+# Search EV = 6p - 2.  Break-even at p = 1/3.
+# Require p >= 0.55 (EV >= 1.3) before considering a search.
+# Carpet-first strategy: only hunt the rat when the payoff is compelling.
+SEARCH_P_THRESHOLD = 0.55
+
+# Don't search at all if we have a primed chain this long ready to roll.
+# Finishing a 2+ cell chain is worth more than a speculative rat search.
+SEARCH_SUPPRESS_IF_CARPET_GTE = 2
+
+# After a miss, wait this many turns before searching again.
+# Prevents cascade-search disasters (3 misses in a row = -6 pts).
+MISS_COOLDOWN_TURNS = 3
 
 
 # ===========================================================================
@@ -48,7 +57,6 @@ def manhattan(a: Tuple[int, int], b: Tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 def get_floor(loc: Tuple[int, int], board_state) -> Cell:
-    """Return the Cell enum for a location using the board's private masks."""
     bit = 1 << xy_to_cell(loc[0], loc[1])
     if board_state._carpet_mask & bit:
         return Cell.CARPET
@@ -62,46 +70,43 @@ def get_floor(loc: Tuple[int, int], board_state) -> Cell:
 def compute_rat_spawn_dist(T: np.ndarray, steps: int = 1000) -> np.ndarray:
     """
     Simulate the rat's 1000-step headstart from cell (0,0).
-
-    This gives the correct initial prior over rat positions instead of a
-    uniform distribution, which was wrong because the rat is NOT uniformly
-    distributed — it starts at (0,0) and walks for 1000 steps.
+    The rat is NOT uniformly distributed at game start.
     """
     dist = np.zeros(NUM_CELLS, dtype=np.float64)
-    dist[xy_to_cell(0, 0)] = 1.0  # rat placed at (0,0) initially
+    dist[xy_to_cell(0, 0)] = 1.0
     for _ in range(steps):
         dist = dist @ T
     total = dist.sum()
     return dist / total if total > 1e-12 else np.ones(NUM_CELLS) / NUM_CELLS
 
-
+class SearchTimeout(Exception):
+    pass
 # ===========================================================================
-# RatBelief — Hidden Markov Model for rat location
+# RatBelief — Hidden Markov Model
 # ===========================================================================
 
 class RatBelief:
     """
     Tracks a probability distribution over all 64 cells for the rat's location.
 
-    Each turn:
-      1. predict()         — propagate belief through transition matrix T
-      2. update_noise()    — reweight using the noise observation
-      3. update_distance() — reweight using the noisy distance sensor
-      4. update_search()   — hard update when a search result is known
+    Update order per turn:
+      1. update_search()   — apply last turn's search result (before rat moved)
+      2. predict()         — rat moves one step according to T
+      3. update_noise()    — reweight using the noise observation
+      4. update_distance() — reweight using the noisy distance sensor
     """
 
     def __init__(self, transition_matrix):
         self.T = np.array(transition_matrix, dtype=np.float64)
-        # Correct prior: simulate 1000-step headstart from (0,0)
         self._spawn_dist = compute_rat_spawn_dist(self.T)
         self.belief = self._spawn_dist.copy()
 
     def predict(self):
-        """Propagate belief one step through the transition model."""
         self.belief = self.belief @ self.T
+        self.belief += 0.001 / NUM_CELLS
+        self._normalize()
 
     def update_noise(self, noise: str, board_state):
-        """Reweight by P(noise | floor_type of each cell)."""
         lk = np.array([
             NOISE_EMIT[get_floor(cell_to_xy(i), board_state)].get(noise, 1e-9)
             for i in range(NUM_CELLS)
@@ -110,60 +115,99 @@ class RatBelief:
         self._normalize()
 
     def update_distance(self, reported_dist: int, worker_pos: Tuple[int, int]):
-        """Reweight by P(reported_dist | true_dist) for each cell."""
         wx, wy = worker_pos
         lk = np.zeros(NUM_CELLS, dtype=np.float64)
         for i in range(NUM_CELLS):
             x, y = cell_to_xy(i)
             true_dist = abs(wx - x) + abs(wy - y)
             if reported_dist == 0:
-                lk[i] = sum(DIST_OFFSETS[o] for o in DIST_OFFSETS if true_dist + o <= 0)
+                lk[i] = sum(DIST_OFFSETS[o] for o in DIST_OFFSETS
+                            if true_dist + o <= 0)
             else:
                 lk[i] = DIST_OFFSETS.get(reported_dist - true_dist, 0.0)
         self.belief *= lk
         self._normalize()
+        
+    def top_cells(self, k: int) -> List[Tuple[float, Tuple[int, int]]]:
+        """Return the k cells with the highest belief probability as (prob, coord) pairs."""
+        idxs = np.argsort(self.belief)[::-1][:k]
+        return [(float(self.belief[i]), cell_to_xy(int(i))) for i in idxs]
+
+    def inverse_distance_heat(self, pos: Tuple[int, int]) -> float:
+        """Measure how close pos is to high-probability rat cells."""
+        top = self.top_cells(8)
+        return sum(p / (1.0 + manhattan(pos, cell)) for p, cell in top)
+
+    def expected_distance(self, pos: Tuple[int, int]) -> float:
+        """Expected Manhattan distance to the rat mass."""
+        top = self.top_cells(8)
+        if not top: return 0.0
+        weight = sum(p for p, _ in top)
+        if weight <= 1e-12: return 0.0
+        return sum(p * manhattan(pos, cell) for p, cell in top) / weight
 
     def update_search(self, searched_pos: Tuple[int, int], found: bool):
-        """Update belief based on a search result (ours or opponent's)."""
         if found:
-            # New rat spawns and does 1000 steps — reset to spawn distribution
             self.belief = self._spawn_dist.copy()
         else:
             self.belief[xy_to_cell(*searched_pos)] = 0.0
             self._normalize()
 
     def best_cell(self) -> Tuple[Tuple[int, int], float, float]:
-        """Return (cell_xy, probability, search_EV) for the most likely rat cell."""
         idx = int(np.argmax(self.belief))
-        p   = float(self.belief[idx])
-        ev  = 6.0 * p - 2.0
+        p = float(self.belief[idx])
+        ev = 6.0 * p - 2.0
         return cell_to_xy(idx), p, ev
+
+    def rat_heat(self, worker_pos: Tuple[int, int]) -> float:
+        idxs = np.argsort(self.belief)[-5:]
+        heat = 0.0
+        for i in idxs:
+            p = float(self.belief[i])
+            if p < 0.05: continue
+            heat += p / (1.0 + manhattan(worker_pos, cell_to_xy(int(i))))
+        return heat
 
     def _normalize(self):
         total = self.belief.sum()
         if total > 1e-12:
             self.belief /= total
         else:
-            # Belief collapsed entirely — reset to spawn distribution
             self.belief = self._spawn_dist.copy()
 
+# ===========================================================================
+# Direction helpers
+# ===========================================================================
+
+_DIRECTION_DELTAS = {
+    enums.Direction.UP:    (0, -1),
+    enums.Direction.DOWN:  (0,  1),
+    enums.Direction.LEFT:  (-1, 0),
+    enums.Direction.RIGHT: (1,  0),
+}
+
+def _move_destination(mv, current_pos: Tuple[int, int]) -> Tuple[int, int]:
+    dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
+    steps = mv.roll_length if mv.move_type == MoveType.CARPET else 1
+    return (current_pos[0] + dx * steps, current_pos[1] + dy * steps)
+
 
 # ===========================================================================
-# Heuristic evaluation
+# Heuristic helpers — cheap raycasts only, no forecast_move calls
 # ===========================================================================
 
-def _max_carpet_potential(loc, board_state):
+def _max_carpet_potential(loc, board_state) -> int:
     """
-    Fast raycast to find the best possible carpet roll from a location.
-    Only counts already-PRIMED cells — this is the immediate carpet value.
+    Best immediate carpet roll from loc.
+    Only counts PRIMED cells — value we can cash in right now.
     """
     max_score = 0
     enemy_loc = board_state.opponent_worker.get_location()
     player_loc = board_state.player_worker.get_location()
 
-    for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
         length = 0
-        nx, ny = loc[0]+dx, loc[1]+dy
+        nx, ny = loc[0] + dx, loc[1] + dy
         while board_state.is_valid_cell((nx, ny)):
             if (nx, ny) == enemy_loc or (nx, ny) == player_loc:
                 break
@@ -181,28 +225,20 @@ def _max_carpet_potential(loc, board_state):
 
 def _future_chain_potential(loc: Tuple[int, int], board_state) -> int:
     """
-    Estimate the maximum carpet chain that could be built from loc.
-
-    Unlike _max_carpet_potential (which counts only primed cells),
-    this counts all *available* cells — SPACE or PRIMED — in each cardinal
-    direction until a BLOCKED, CARPET, or worker cell is hit.
-
-    The result is CARPET_SCORE for the best direction, capturing how much
-    long-run scoring power exists at this position.  This is the key
-    heuristic term that Carrie's reference bot uses ("cell potential").
+    Maximum carpet chain that COULD be built from loc.
+    Counts SPACE + PRIMED cells in each direction until blocked.
     """
     best = 0
-    enemy_loc  = board_state.opponent_worker.get_location()
+    enemy_loc = board_state.opponent_worker.get_location()
     player_loc = board_state.player_worker.get_location()
 
-    for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
         length = 0
-        nx, ny = loc[0]+dx, loc[1]+dy
+        nx, ny = loc[0] + dx, loc[1] + dy
         while board_state.is_valid_cell((nx, ny)):
             if (nx, ny) == enemy_loc or (nx, ny) == player_loc:
                 break
             bit = 1 << (ny * BOARD_SIZE + nx)
-            # BLOCKED or CARPET cells permanently end the chain
             if (board_state._blocked_mask | board_state._carpet_mask) & bit:
                 break
             length += 1
@@ -213,109 +249,130 @@ def _future_chain_potential(loc: Tuple[int, int], board_state) -> int:
     return best
 
 
-def evaluate(board_state, rat_belief: RatBelief) -> float:
+def _chain_continuation_bonus(dest: Tuple[int, int], dx: int, dy: int,
+                               board_state) -> float:
     """
-    Evaluate board from the perspective of board_state.player_worker.
-    Higher is better for us.
+    Count PRIMED cells immediately ahead of dest in direction (dx, dy).
+    Priming dest when primed cells are already ahead = carpet roll next turn.
+    Each primed cell ahead = +3 move-ordering points.
+    """
+    count = 0
+    nx, ny = dest[0] + dx, dest[1] + dy
+    while board_state.is_valid_cell((nx, ny)):
+        bit = 1 << (ny * BOARD_SIZE + nx)
+        if board_state._primed_mask & bit:
+            count += 1
+            nx += dx
+            ny += dy
+        else:
+            break
+    return count * 3.0
 
-    Three components:
-      1. Score differential
-      2. Immediate carpet potential  (existing primed chain)
-      3. Future chain potential      (buildable run of SPACE+PRIMED cells)
-      4. Rat proximity / search EV   (only when belief is strong)
-    """
-    my  = board_state.player_worker
+
+# ===========================================================================
+# Static evaluation
+# ===========================================================================
+def reachable_space(loc: Tuple[int, int], board_state) -> int:
+    """Flood-fill to determine positional dominance and prevent getting trapped."""
+    visited = set()
+    stack = [loc]
+    while stack:
+        cur = stack.pop()
+        if cur in visited: continue
+        visited.add(cur)
+        
+        for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+            nx, ny = cur[0]+dx, cur[1]+dy
+            if not board_state.is_valid_cell((nx, ny)): continue
+            
+            bit = 1 << xy_to_cell(nx, ny)
+            if (board_state._blocked_mask | board_state._carpet_mask) & bit:
+                continue
+            stack.append((nx, ny))
+    return len(visited)
+
+def evaluate(board_state, rat_belief: RatBelief, depth_simulated: int = 0) -> float:
+    my = board_state.player_worker
     opp = board_state.opponent_worker
-    my_loc  = my.get_location()
+    my_loc = my.get_location()
     opp_loc = opp.get_location()
 
-    # 1. Base Score
-    score = float(my.get_points() - opp.get_points())
+    # 1. Base Score Difference
+    score = 30.0 * (my.get_points() - opp.get_points())
 
-    # 2. Immediate Carpet Potential — already-primed runs ready to carpet
-    my_carpet  = _max_carpet_potential(my_loc,  board_state)
+    # 2. Dynamic Threat Multiplier & Stolen Carpet Paranoia (Symmetric)
+    my_carpet = _max_carpet_potential(my_loc, board_state)
     opp_carpet = _max_carpet_potential(opp_loc, board_state)
-    score += 0.7 * my_carpet
-    score -= 0.7 * opp_carpet
 
-    # 3. Future Chain Potential — how long a chain *could* be built here.
-    # This is the Carrie-level positional insight: a worker sitting at the
-    # start of a long open corridor is worth much more than one in a corner.
-    # Opponent penalty is slightly lighter: we can't actually block their run
-    # (workers can't step on primed squares), so over-weighting it sends us
-    # to the wrong side of the board.
-    my_future  = _future_chain_potential(my_loc,  board_state)
-    opp_future = _future_chain_potential(opp_loc, board_state)
-    score += 0.3 * my_future
-    score -= 0.2 * opp_future
+    worker_dist = manhattan(my_loc, opp_loc)
+    
+    if worker_dist <= 2:
+        carpet_weight = 5.0    # High threat panic: Roll instantly!
+    elif worker_dist <= 4:
+        carpet_weight = 17.0   # Medium threat: Cash out medium lengths
+    else:
+        carpet_weight = 22.0   # Safe: Patiently build massive chains
 
-    # 4. Rat Proximity — only pull toward rat when belief is meaningful.
-    # Below p=0.2 the carpet income is more reliable than rat-hunting.
-    rat_cell, rat_p, rat_ev = rat_belief.best_cell()
-    if rat_p > 0.2:
-        my_d  = manhattan(my_loc,  rat_cell)
-        opp_d = manhattan(opp_loc, rat_cell)
-        score += 4.0 * rat_p * (opp_d - my_d)
-        if rat_ev > 0:
-            score += rat_ev
+    score += carpet_weight * my_carpet
+    score -= carpet_weight * opp_carpet
+
+    # 3. Future Chain Potential
+    horizon = max(0.1, (my.turns_left or 1) / 40.0)
+    score += 4.0 * _future_chain_potential(my_loc, board_state) * horizon
+    score -= 4.0 * _future_chain_potential(opp_loc, board_state) * horizon
+
+    # 4. Mobility / Open Space
+    my_space = reachable_space(my_loc, board_state)
+    opp_space = reachable_space(opp_loc, board_state)
+    score += 0.5 * my_space
+    score -= 0.5 * opp_space
+
+    # 5. Rat Hunting
+    if rat_belief is not None:
+        decay = 0.85 ** depth_simulated
+        if my_carpet <= 2:
+            my_heat = rat_belief.inverse_distance_heat(my_loc)
+            my_dist = rat_belief.expected_distance(my_loc)
+            score += (8.0 * my_heat - 0.5 * my_dist) * decay
+            
+        if opp_carpet <= 2:
+            opp_heat = rat_belief.inverse_distance_heat(opp_loc)
+            opp_dist = rat_belief.expected_distance(opp_loc)
+            score -= (8.0 * opp_heat - 0.5 * opp_dist) * decay
 
     return score
-
-
 # ===========================================================================
-# Move ordering helper
+# Move ordering — cheap raycasts, NO forecast_move calls
 # ===========================================================================
 
-def quick_score(mv, rat_belief: RatBelief) -> float:
-    """Fast greedy score used for move ordering in expectiminimax."""
+def quick_score(mv, board_state, rat_belief: RatBelief) -> float:
+    """
+    Fast static move ordering to maximize alpha-beta cutoffs.
+
+    IMPORTANT: this must NOT call forecast_move(). Calling forecast_move here
+    means O(moves) extra forecasts per interior node just for sorting — this
+    kills search depth. Cheap raycasts give nearly identical ordering quality.
+
+    PRIME moves get a chain continuation bonus: if priming in direction d puts
+    us adjacent to already-primed cells in that same direction, a carpet roll
+    is one move away — strongly prefer extending the chain.
+    """
     if mv.move_type == MoveType.CARPET:
-        return float(CARPET_SCORE.get(mv.roll_length, 0))
+        return 100.0 + CARPET_SCORE.get(mv.roll_length, 0)
+
     if mv.move_type == MoveType.PRIME:
-        return 0.5
-    if mv.move_type == MoveType.SEARCH:
-        p = float(rat_belief.belief[xy_to_cell(*mv.search_loc)])
-        return 6.0 * p - 2.0
-    return 0.0   # PLAIN
+        my_loc = board_state.player_worker.get_location()
+        dest = _move_destination(mv, my_loc)
+        dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
+        chain_bonus = _chain_continuation_bonus(dest, dx, dy, board_state)
+        future = _future_chain_potential(dest, board_state)
+        return 10.0 + future + chain_bonus
 
+    if mv.move_type == MoveType.PLAIN:
+        return 1.0
 
-# ===========================================================================
-# Expectiminimax with alpha-beta pruning
-# ===========================================================================
-
-def expectiminimax(
-    board_state,
-    depth: int,
-    rat_belief: RatBelief,
-    alpha: float,
-    beta: float,
-    time_left: Callable,
-) -> float:
-    if depth == 0 or time_left() < 1.0:
-        return evaluate(board_state, rat_belief)
-
-    moves = board_state.get_valid_moves(exclude_search=True)
-    if not moves:
-        return evaluate(board_state, rat_belief)
-
-    moves = sorted(moves, key=lambda m: quick_score(m, rat_belief), reverse=True)
-
-    value = float('-inf')
-    for mv in moves:
-        if time_left() < 1.0:
-            break
-        try:
-            child = board_state.forecast_move(mv)
-            child.reverse_perspective()
-            child_val = -expectiminimax(child, depth - 1, rat_belief, -beta, -alpha, time_left)
-        except Exception:
-            child_val = quick_score(mv, rat_belief)
-
-        value = max(value, child_val)
-        alpha = max(alpha, value)
-        if alpha >= beta:
-            break
-
-    return value
+    # SEARCH is excluded from tree generation
+    return -1000.0
 
 
 # ===========================================================================
@@ -323,10 +380,6 @@ def expectiminimax(
 # ===========================================================================
 
 class PlayerAgent:
-    """
-    /you may add and modify functions, however, __init__, commentate and play are the entry points for
-    your program and should not be changed.
-    """
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
         self.rat_belief: RatBelief | None = None
@@ -335,186 +388,294 @@ class PlayerAgent:
         if transition_matrix is not None:
             self.rat_belief = RatBelief(transition_matrix)
 
-        self._turns   = 0
-        self._hits    = 0
-        self._misses  = 0
-        self._last_opp_search    = None
-        # BUG FIX: the original code had a guard for opponent search but NOT for
-        # player search. Without this, board.player_search persists across turns,
-        # so the same search result gets re-applied every single turn, slowly
-        # zeroing out probability mass and corrupting the entire belief.
-        self._last_player_search = None
+        self._turns = 0
+        self._hits = 0
+        self._misses = 0
+        self._last_opp_search_turn = -1
+        self._last_my_search_turn = -1
+        self._miss_cooldown = 0
+        
+        # New Detailed Stat Trackers
+        self._primes_done = 0
+        self._carpets_made = 0
+        
+        self._tt = {}
+        self._last_turns_remaining = None
 
     def commentate(self):
+        rats_searched = self._hits + self._misses
+        points_lost = self._misses * 2
+        
+        stats = (f"Primes: {self._primes_done} | Carpets: {self._carpets_made} | "
+                 f"Rats Found: {self._hits} | Searched: {rats_searched} | Pts Lost: {points_lost}")
+                 
         if self.rat_belief is not None:
             cell, p, ev = self.rat_belief.best_cell()
-            return (
-                f"Turns: {self._turns} | "
-                f"Rat searches — hits: {self._hits}, misses: {self._misses} | "
-                f"Final rat peak: {cell}  p={p:.3f}  EV={ev:.2f}"
-            )
-        return f"Turns: {self._turns} (no HMM — transition matrix was not provided)"
+            return f"Turns: {self._turns} | {stats} | Peak: {cell} p={p:.3f} EV={ev:.2f}"
+        return f"Turns: {self._turns} | {stats} | (no HMM)"
 
-    def play(
-        self,
-        board: board.Board,
-        sensor_data: Tuple,
-        time_left: Callable,
-    ):
+    def _return_and_track(self, mv):
+        """Helper to update our stats before returning a move."""
+        if mv is None: 
+            return move.Move.search((random.randint(0, 7), random.randint(0, 7)))
+        if mv.move_type == MoveType.CARPET:
+            self._carpets_made += 1
+        elif mv.move_type == MoveType.PRIME:
+            self._primes_done += 1
+        return mv
+
+    def _state_key(self, board):
+        """Builds a hashable key for the Transposition Table."""
+        return (
+            board.player_worker.get_location(),
+            board.opponent_worker.get_location(),
+            board.player_worker.get_points(),
+            board.opponent_worker.get_points(),
+            board._primed_mask,
+            board._carpet_mask,
+        )
+    
+    # ------------------------------------------------------------------
+    # Negamax with alpha-beta pruning
+    # ------------------------------------------------------------------
+
+    def _negamax(self, board_state, depth: int, rat_belief: RatBelief,
+                alpha: float, beta: float, end_time: float,
+                tt: dict, depth_simulated: int = 0) -> float:
+                
+        if time.time() > end_time:
+            raise SearchTimeout()
+
+        state_key = (
+            board_state._primed_mask, board_state._carpet_mask,
+            board_state.player_worker.get_location(), board_state.opponent_worker.get_location(),
+            board_state.player_worker.get_points() - board_state.opponent_worker.get_points(),
+            board_state.player_worker.turns_left
+        )
+        
+        cached = tt.get(state_key)
+        if cached is not None and cached[0] >= depth:
+            return cached[1]
+
+        if depth == 0 or (board_state.player_worker.turns_left or 0) == 0:
+            val = evaluate(board_state, rat_belief, depth_simulated)
+            tt[state_key] = (depth, val)
+            return val
+
+        moves = list(board_state.get_valid_moves(exclude_search=True))
+        if not moves:
+            val = evaluate(board_state, rat_belief, depth_simulated)
+            tt[state_key] = (depth, val)
+            return val
+
+        moves.sort(key=lambda m: quick_score(m, board_state, rat_belief), reverse=True)
+
+        if depth <= 1: moves = moves[:8]
+        elif depth <= 2: moves = moves[:10]
+        else: moves = moves[:14]
+
+        best = -float("inf")
+        for mv in moves:
+            if time.time() > end_time:
+                raise SearchTimeout()
+
+            child = board_state.forecast_move(mv)
+            if child is None: continue
+
+            child.reverse_perspective()
+            val = -self._negamax(child, depth - 1, rat_belief,
+                        -beta, -alpha, end_time, tt,
+                        depth_simulated + 1)
+
+            if val > best: best = val
+            alpha = max(alpha, best)
+            if alpha >= beta: break
+
+        if best == -float("inf"):
+            best = evaluate(board_state, rat_belief, depth_simulated)
+
+        tt[state_key] = (depth, best)
+        return best    # ------------------------------------------------------------------
+    # Main play method
+    # ------------------------------------------------------------------
+
+    def play(self, board: board.Board, sensor_data: Tuple, time_left: Callable):
+        my_turns = board.player_worker.turns_left
+
+        # Continuous game reset detector
+        if self._last_turns_remaining is None or my_turns > self._last_turns_remaining:
+            self._turns = 0
+            self._tt.clear()
+            self._miss_cooldown = 0
+            if self._tm is not None:
+                self.rat_belief = RatBelief(self._tm)
+
+        self._last_turns_remaining = my_turns - 1
         self._turns += 1
 
-        # ------------------------------------------------------------------
-        # 0. Lazy-init HMM if transition_matrix was not given in __init__
-        # ------------------------------------------------------------------
+        if self._miss_cooldown > 0:
+            self._miss_cooldown -= 1
+
+        # 0. Lazy-init HMM
         if self.rat_belief is None:
             tm = self._tm
             if tm is None:
-                try:
-                    tm = board.transition_matrix
-                except AttributeError:
-                    pass
-            if tm is not None:
-                self.rat_belief = RatBelief(tm)
+                try: tm = board.transition_matrix
+                except AttributeError: pass
+            if tm is not None: self.rat_belief = RatBelief(tm)
 
         rb = self.rat_belief
-
-        # ------------------------------------------------------------------
-        # 1. Unpack sensor data  (noise_string, reported_distance)
-        # ------------------------------------------------------------------
         noise, reported_dist = sensor_data
 
-        # ------------------------------------------------------------------
-        # 2. HMM update
-        # ------------------------------------------------------------------
+        # 1. HMM Update
+        # 1. HMM Update — process searches FIRST, then predict, then observe
         if rb is not None:
-            # 2a. Predict: rat moves one step according to T
-            rb.predict()
-
-            # 2b. Reweight by noise observation
-            if noise is not None:
-                rb.update_noise(noise, board)
-
-            # 2c. Reweight by noisy distance sensor
-            if reported_dist is not None:
-                rb.update_distance(reported_dist, board.player_worker.get_location())
-
-            # 2d. Incorporate opponent search result (guard against re-processing)
+            # Process opponent's search result
             opp_loc, opp_found = board.opponent_search
-            if opp_loc is not None and opp_loc != self._last_opp_search:
+            if opp_loc is not None and self._turns != self._last_opp_search_turn:
                 rb.update_search(opp_loc, opp_found)
-                self._last_opp_search = opp_loc
+                self._last_opp_search_turn = self._turns
 
-            # 2e. Incorporate our own previous search result — only once per unique
-            # search location. The original code had NO guard here, meaning the same
-            # result was applied every subsequent turn, corrupting the belief.
-            my_loc, my_found = board.player_search
-            if my_loc is not None and my_loc != self._last_player_search:
+            # Process our own search result
+            my_search_loc, my_found = board.player_search
+            if my_search_loc is not None and self._turns != self._last_my_search_turn:
                 if my_found:
                     self._hits += 1
                 else:
                     self._misses += 1
-                rb.update_search(my_loc, my_found)
-                self._last_player_search = my_loc
+                rb.update_search(my_search_loc, my_found)
+                self._last_my_search_turn = self._turns
 
-        # ------------------------------------------------------------------
-        # 3. Get valid moves (searches handled separately below)
-        # ------------------------------------------------------------------
+            # CRITICAL FIX: The rat moves twice between your turns! 
+            if self._turns > 1:
+                rb.predict()
+                rb.predict()
+
+            # Observe this turn's sensor data
+            noise_str = None
+            if noise is not None:
+                noise_str = str(noise).split(".")[-1].strip().lower()
+            if noise_str is not None:
+                rb.update_noise(noise_str, board)
+            if reported_dist is not None:
+                try:
+                    rb.update_distance(int(reported_dist),
+                                       board.player_worker.get_location())
+                except Exception:
+                    pass
+
         moves = board.get_valid_moves(exclude_search=True)
+        turns_left = max(1, board.player_worker.turns_left)
 
-        # ------------------------------------------------------------------
-        # 4. Opportunistic search: search when EV > 0 (p > 1/3)
-        #    but only if search EV beats the best available carpet move.
-        #    This prevents wasteful searches when we're sitting at a long chain.
-        # ------------------------------------------------------------------
-        if rb is not None:
+        if turns_left == 1:
+            carpet_moves = [m for m in moves if m.move_type == MoveType.CARPET]
+            if carpet_moves:
+                return max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
+
+        # 2. Opportunistic Search (High confidence only)
+        if rb is not None and self._miss_cooldown == 0:
             rat_cell, rat_p, rat_ev = rb.best_cell()
-            if rat_ev >= SEARCH_EV_THRESHOLD:
-                best_carpet_score = max(
-                    (CARPET_SCORE.get(m.roll_length, 0) for m in moves
-                     if m.move_type == MoveType.CARPET),
-                    default=0
-                )
-                # Only search if its EV beats the best immediate carpet
-                if rat_ev >= best_carpet_score:
+            my_score = board.player_worker.get_points()
+            opp_score = board.opponent_worker.get_points()
+            
+            ev_threshold = 1.3  # Standard: requires ~55% probability
+            if my_score < opp_score:
+                ev_threshold = 0.8  # Trailing: take more risks (requires ~46% prob)
+            if turns_left <= 10:
+                ev_threshold = max(0.5, ev_threshold - 0.5) # Desperate endgame
+
+            if rat_ev >= ev_threshold:
+                my_loc_now = board.player_worker.get_location()
+                my_carpet_now = _max_carpet_potential(my_loc_now, board)
+                
+                # Do not waste a turn searching if we have a prime chain of 4+ points ready
+                if my_carpet_now < 4:
                     return move.Move.search(rat_cell)
-
-        # ------------------------------------------------------------------
-        # 5. Iterative-deepening expectiminimax (guarded by time budget)
-        # ------------------------------------------------------------------
+                
+        # 3. Iterative-deepening Alpha-Beta Search
         if moves and rb is not None:
+            if not hasattr(self, '_tt'): self._tt = {}
+            self._tt.clear()
+            
             start_time = time.time()
+            turns_left = max(1, board.player_worker.turns_left or 1)
+            
+            # Custom Time Budgeting: Hoard time for the mid-game (turns 15-30)
+            safe_buffer = 1.2
+            usable_time = max(0.1, time_left() - safe_buffer)
+            if 15 <= turns_left <= 30:
+                allocated = min(4.0, usable_time / 3.0)
+            else:
+                allocated = min(2.5, usable_time / max(1, turns_left))
+                
+            end_time = start_time + allocated
+            
+            # 1-Ply Root Forecasting to prep the move order
+            root_scored = []
+            for mv in moves:
+                child = board.forecast_move(mv)
+                if child is None: continue
+                child.reverse_perspective() 
+                root_scored.append((-evaluate(child, rb), mv))
+                
+            root_scored.sort(key=lambda x: x[0], reverse=True)
+            moves_ordered = [m for v, m in root_scored] or moves
 
-            turns_left = max(1, board.player_worker.turns_left)
-            allocated_time = max(0.5, min(4.0, (time_left() - 2.0) / turns_left))
+            global_best_move = moves_ordered[0]
 
-            best_move = None
-
-            for current_depth in range(1, 10):
-                if time.time() - start_time > allocated_time / 2:
-                    break
-
-                moves_ordered = sorted(moves, key=lambda m: quick_score(m, rb), reverse=True)
-
-                if best_move is None:
-                    best_move = moves_ordered[0]
-
-                depth_best_move = moves_ordered[0]
-                best_val  = float('-inf')
-                alpha     = float('-inf')
-                beta      = float('inf')
-                search_aborted = False
-
-                for mv in moves_ordered:
-                    if time.time() - start_time > allocated_time:
-                        search_aborted = True
+            try:
+                for depth in range(1, 15):  # Will automatically break via timeout
+                    if time.time() > end_time:
                         break
+                        
+                    alpha = -float("inf")
+                    beta = float("inf")
+                    best_val_this_depth = -float("inf")
 
-                    try:
+                    # Principal Variation Sorting: Force the best move to the front
+                    if global_best_move in moves_ordered:
+                        moves_ordered.remove(global_best_move)
+                        moves_ordered.insert(0, global_best_move)
+
+                    for mv in moves_ordered:
+                        if time.time() > end_time:
+                            raise SearchTimeout()
+                            
                         child = board.forecast_move(mv)
+                        if child is None: continue
+                        
                         child.reverse_perspective()
-                        val = -expectiminimax(
-                            child,
-                            current_depth - 1,
-                            rb,
-                            -beta,
-                            -alpha,
-                            lambda: allocated_time - (time.time() - start_time)
-                        )
-                    except Exception:
-                        val = quick_score(mv, rb)
+                        val = -self._negamax(child, depth - 1, rb, -beta, -alpha, end_time, self._tt)
 
-                    if val > best_val:
-                        best_val        = val
-                        depth_best_move = mv
-                    alpha = max(alpha, best_val)
+                        if val > best_val_this_depth:
+                            best_val_this_depth = val
+                            global_best_move = mv  # Safely lock it in!
 
-                if not search_aborted:
-                    best_move = depth_best_move
+                        alpha = max(alpha, best_val_this_depth)
+                        
+            except SearchTimeout:
+                # We ran out of time! Cleanly break out.
+                pass 
 
-            if best_move is not None:
-                return best_move
-
-        # ------------------------------------------------------------------
-        # 6. Greedy fallback  (carpet > prime > move-toward-rat > random)
-        # ------------------------------------------------------------------
-        if moves:
-            return self._greedy(moves, board, rb)
-
+            return self._return_and_track(global_best_move)
+            
+        # 4. Greedy fallback
+        if moves: 
+            return self._return_and_track(self._greedy(moves, board, rb))
+            
         return move.Move.search((random.randint(0, 7), random.randint(0, 7)))
 
-    # -----------------------------------------------------------------------
-    # Helper: greedy move selection
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Greedy fallback move selection
+    # ------------------------------------------------------------------
+
     def _greedy(self, moves, board_state, rb):
         """
-        Greedy fallback priority:
-          1. Best-scoring carpet roll (roll_length >= 2)
-          2. Prime step toward the highest future-chain-potential destination
-          3. Plain step toward rat (only if p > 0.15, otherwise toward best future)
+        Priority: carpet roll > prime (chain-aware) > plain (rat or corridor)
         """
         carpet_moves = []
-        prime_moves  = []
-        plain_moves  = []
+        prime_moves = []
+        plain_moves = []
 
         for mv in moves:
             if mv.move_type == MoveType.CARPET:
@@ -524,62 +685,41 @@ class PlayerAgent:
             elif mv.move_type == MoveType.PLAIN:
                 plain_moves.append(mv)
 
+        # 1. Best scoring carpet roll
         if carpet_moves:
-            best = max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
+            best = max(carpet_moves,
+                       key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
             if CARPET_SCORE.get(best.roll_length, -1) > 0:
                 return best
 
         my_loc = board_state.player_worker.get_location()
 
+        # 2. Prime: future chain potential + chain continuation bonus
         if prime_moves:
-            # Pick the prime direction that maximises future chain potential
-            # at the destination.  This is the Carrie-level insight: don't just
-            # prime randomly — position yourself at the start of the longest
-            # available corridor.
-            best_prime = max(
-                prime_moves,
-                key=lambda mv: _future_chain_potential(
-                    _move_destination(mv, my_loc), board_state
-                )
-            )
-            return best_prime
+            def prime_key(mv):
+                dest = _move_destination(mv, my_loc)
+                dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
+                return (_future_chain_potential(dest, board_state)
+                        + _chain_continuation_bonus(dest, dx, dy, board_state))
+            return max(prime_moves, key=prime_key)
 
+        # 3. Plain: move toward rat if concentrated, else best open corridor
         if plain_moves:
             if rb is not None:
                 rat_cell, rat_p, _ = rb.best_cell()
                 if rat_p > 0.15:
-                    # Navigate toward the rat when belief is strong
                     plain_moves.sort(
                         key=lambda m: manhattan(
                             _move_destination(m, my_loc), rat_cell
                         )
                     )
                     return plain_moves[0]
-            # Otherwise drift toward the best future-chain-potential cell
             plain_moves.sort(
                 key=lambda mv: _future_chain_potential(
                     _move_destination(mv, my_loc), board_state
                 ),
-                reverse=True
+                reverse=True,
             )
             return plain_moves[0]
 
         return random.choice(moves)
-
-
-# ===========================================================================
-# Helper: compute destination of a plain/prime/carpet move
-# ===========================================================================
-
-_DIRECTION_DELTAS = {
-    enums.Direction.UP:    (0, -1),
-    enums.Direction.DOWN:  (0,  1),
-    enums.Direction.LEFT:  (-1, 0),
-    enums.Direction.RIGHT: (1,  0),
-}
-
-def _move_destination(mv, current_pos: Tuple[int, int]) -> Tuple[int, int]:
-    """Compute where a move lands given the current position."""
-    dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
-    steps = mv.roll_length if mv.move_type == MoveType.CARPET else 1
-    return (current_pos[0] + dx * steps, current_pos[1] + dy * steps)
