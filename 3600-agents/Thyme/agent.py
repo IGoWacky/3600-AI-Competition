@@ -114,6 +114,25 @@ def evaluate(board_state, rb: RatBelief):
 
     return score
 
+def max_carpet_length(loc, board_state):
+    max_len = 0
+    px, py = loc
+
+    for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+        length = 0
+        x, y = px + dx, py + dy
+
+        while 0 <= x < 8 and 0 <= y < 8:
+            if board_state.get_cell((x, y)) == Cell.PRIMED:
+                length += 1
+                x += dx
+                y += dy
+            else:
+                break
+
+        max_len = max(max_len, length)
+
+    return max_len
 
 # ======================================================================
 # MINIMAX (SIMPLIFIED BUT CONSISTENT)
@@ -205,7 +224,7 @@ class PlayerAgent:
         # ----------------------------
         if self.rb:
             (cx, cy), p = self.rb.best_cell()
-            if p > 0.55:
+            if p > 0.65:
                 self.searches += 1
                 return move.Move.search((cx, cy))
 
@@ -231,7 +250,16 @@ class PlayerAgent:
 
                 # carpet bonus (from first agent)
                 if m.move_type == MoveType.CARPET:
-                    val += 5
+                    val += CARPET_SCORE.get(m.roll_length, 5) * 2
+
+                dest = nb.player_worker.get_location()
+                future_len = max_carpet_length(dest, board)
+                val += CARPET_SCORE.get(future_len, 0) * 0.5
+
+                # --- Bad priming penalty ---
+                if m.move_type == MoveType.PRIME:
+                    if future_len == 0:
+                        val -= 2
 
                 # search move value FIXED
                 if m.move_type == MoveType.SEARCH and self.rb:
