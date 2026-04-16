@@ -36,7 +36,7 @@ SEARCH_P_THRESHOLD = 0.55
 
 # Don't search at all if we have a primed chain this long ready to roll.
 # Finishing a 2+ cell chain is worth more than a speculative rat search.
-SEARCH_SUPPRESS_IF_CARPET_GTE = 2
+SEARCH_SUPPRESS_IF_CARPET_GTE = 3
 
 # After a miss, wait this many turns before searching again.
 # Prevents cascade-search disasters (3 misses in a row = -6 pts).
