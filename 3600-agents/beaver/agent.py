@@ -17,10 +17,10 @@ NUM_CELLS = BOARD_SIZE * BOARD_SIZE
 
 # P(noise | floor_type)  —  squeak / scratch / squeal
 NOISE_EMIT = {
-    Cell.BLOCKED: {"squeak": 0.5,  "scratch": 0.3,  "squeal": 0.2},
-    Cell.SPACE:   {"squeak": 0.7,  "scratch": 0.15, "squeal": 0.15},
-    Cell.PRIMED:  {"squeak": 0.1,  "scratch": 0.8,  "squeal": 0.1},
-    Cell.CARPET:  {"squeak": 0.1,  "scratch": 0.1,  "squeal": 0.8},
+    Cell.BLOCKED: {enums.Noise.SQUEAK: 0.5,  enums.Noise.SCRATCH: 0.3,  enums.Noise.SQUEAL: 0.2},
+    Cell.SPACE:   {enums.Noise.SQUEAK: 0.7,  enums.Noise.SCRATCH: 0.15, enums.Noise.SQUEAL: 0.15},
+    Cell.PRIMED:  {enums.Noise.SQUEAK: 0.1,  enums.Noise.SCRATCH: 0.8,  enums.Noise.SQUEAL: 0.1},
+    Cell.CARPET:  {enums.Noise.SQUEAK: 0.1,  enums.Noise.SCRATCH: 0.1,  enums.Noise.SQUEAL: 0.8},
 }
 
 # P(reported_dist = true_dist + offset)
@@ -106,7 +106,7 @@ class RatBelief:
         self.belief += 0.001 / NUM_CELLS
         self._normalize()
 
-    def update_noise(self, noise: str, board_state):
+    def update_noise(self, noise, board_state):
         lk = np.array([
             NOISE_EMIT[get_floor(cell_to_xy(i), board_state)].get(noise, 1e-9)
             for i in range(NUM_CELLS)
@@ -553,11 +553,8 @@ class PlayerAgent:
                 rb.predict()
 
             # Observe this turn's sensor data
-            noise_str = None
             if noise is not None:
-                noise_str = str(noise).split(".")[-1].strip().lower()
-            if noise_str is not None:
-                rb.update_noise(noise_str, board)
+                rb.update_noise(noise, board)
             if reported_dist is not None:
                 try:
                     rb.update_distance(int(reported_dist),
