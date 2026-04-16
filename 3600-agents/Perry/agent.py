@@ -269,6 +269,32 @@ def _chain_continuation_bonus(dest: Tuple[int, int], dx: int, dy: int,
     return count * 3.0
 
 
+def _adjacent_primed_chain(loc, board_state):
+    """
+    Returns the length of the longest contiguous PRIMED chain
+    starting adjacent to loc in any direction.
+    """
+    best = 0
+
+    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+        length = 0
+        nx, ny = loc[0] + dx, loc[1] + dy
+
+        while board_state.is_valid_cell((nx, ny)):
+            bit = 1 << xy_to_cell(nx, ny)
+
+            if board_state._primed_mask & bit:
+                length += 1
+                nx += dx
+                ny += dy
+            else:
+                break
+
+        best = max(best, length)
+
+    return best
+
+
 # ===========================================================================
 # Static evaluation
 # ===========================================================================
@@ -314,6 +340,9 @@ def evaluate(board_state, rat_belief: RatBelief, depth_simulated: int = 0) -> fl
         carpet_weight = 22.0   # Safe: Patiently build massive chains
 
     score += carpet_weight * my_carpet
+    chain_now = _adjacent_primed_chain(my_loc, board_state)
+    if chain_now >= 3:
+        score += 5 * CARPET_SCORE.get(chain_now, 0)
     score -= carpet_weight * opp_carpet
 
     # 3. Future Chain Potential
@@ -617,7 +646,14 @@ class PlayerAgent:
                 child = board.forecast_move(mv)
                 if child is None: continue
                 child.reverse_perspective() 
-                root_scored.append((-evaluate(child, rb), mv))
+                if mv.move_type == MoveType.CARPET:
+                    chain_len = _adjacent_primed_chain(
+                        board.player_worker.get_location(), board
+                    )
+                    extra = 3.0 * CARPET_SCORE.get(chain_len, 0)
+                else:
+                    extra = 0
+                root_scored.append((-evaluate(child, rb) + extra, mv))
                 
             root_scored.sort(key=lambda x: x[0], reverse=True)
             moves_ordered = [m for v, m in root_scored] or moves
@@ -678,9 +714,13 @@ class PlayerAgent:
         prime_moves = []
         plain_moves = []
 
+        my_loc = board_state.player_worker.get_location()
+
         for mv in moves:
             if mv.move_type == MoveType.CARPET:
-                carpet_moves.append(mv)
+                chain_len = _adjacent_primed_chain(my_loc, board_state)
+                return_score = 3.0 * CARPET_SCORE.get(chain_len, 0)
+                carpet_moves.append((return_score, mv))
             elif mv.move_type == MoveType.PRIME:
                 prime_moves.append(mv)
             elif mv.move_type == MoveType.PLAIN:
@@ -688,20 +728,25 @@ class PlayerAgent:
 
         # 1. Best scoring carpet roll
         if carpet_moves:
-            best = max(carpet_moves,
-                       key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
-            if CARPET_SCORE.get(best.roll_length, -1) > 0:
-                return best
-
-        my_loc = board_state.player_worker.get_location()
+            best = max(carpet_moves, key=lambda x: x[0])[1]
+            return best
 
         # 2. Prime: future chain potential + chain continuation bonus
         if prime_moves:
             def prime_key(mv):
                 dest = _move_destination(mv, my_loc)
                 dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
-                return (_future_chain_potential(dest, board_state)
-                        + _chain_continuation_bonus(dest, dx, dy, board_state))
+
+                chain_now = _adjacent_primed_chain(my_loc, board_state)
+                future = _future_chain_potential(dest, board_state)
+                chain_bonus = _chain_continuation_bonus(dest, dx, dy, board_state)
+
+                score = future + chain_bonus
+
+                if chain_now >= 3:
+                    score -= 10  # 🔥 discourage over-priming when cash-out is ready
+
+                return score
             return max(prime_moves, key=prime_key)
 
         # 3. Plain: move toward rat if concentrated, else best open corridor
