@@ -330,7 +330,19 @@ def evaluate(board_state, rat_belief: RatBelief, depth_simulated: int = 0) -> fl
     my_carpet = _max_carpet_potential(my_loc, board_state)
     opp_carpet = _max_carpet_potential(opp_loc, board_state)
 
+    # === NEW: discourage small carpets ===
+    if my_carpet < 5:
+        score -= 8
+    
+    # === NEW: panic if opponent can cash big ===
+    if opp_carpet >= 5:
+        score -= 20
+
     worker_dist = manhattan(my_loc, opp_loc)
+
+    # === NEW: interference logic ===
+    if opp_carpet >= 4:
+        score -= 5 * worker_dist   # move closer to disrupt
     
     if worker_dist <= 2:
         carpet_weight = 5.0    # High threat panic: Roll instantly!
@@ -593,6 +605,14 @@ class PlayerAgent:
                     pass
 
         moves = board.get_valid_moves(exclude_search=True)
+ 
+        # === ADD: include search as a root option ===
+        search_move = None
+        if rb is not None:
+            rat_cell, rat_p, rat_ev = rb.best_cell()
+            if rat_ev > 0:  # only consider worthwhile searches
+                search_move = move.Move.search(rat_cell)
+
         turns_left = max(1, board.player_worker.turns_left)
 
         if turns_left == 1:
@@ -601,7 +621,7 @@ class PlayerAgent:
                 best = max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
                 if best is not None and best.roll_length >= 2:
                     return self._return_and_track(best)
-                
+                    
             if rb is not None:
                 rat_cell, rat_p, rat_ev = rb.best_cell()
                 if rat_ev >= 0.8:
@@ -623,11 +643,15 @@ class PlayerAgent:
             my_score = board.player_worker.get_points()
             opp_score = board.opponent_worker.get_points()
             
-            ev_threshold = 2  # Standard threshold
+            my_score = board.player_worker.get_points()
+            opp_score = board.opponent_worker.get_points()
+            
             if my_score < opp_score:
-                ev_threshold = 1.6  # Trailing: take more risks
-            if turns_left <= 10:
-                ev_threshold = ev_threshold - 1.3 # Desperate endgame
+                ev_threshold = 1.4
+            elif turns_left <= 10:
+                ev_threshold = 1.1
+            else:
+                ev_threshold = 1.7
 
             if rat_ev >= ev_threshold:
                 my_loc_now = board.player_worker.get_location()
@@ -657,19 +681,32 @@ class PlayerAgent:
             
             # 1-Ply Root Forecasting to prep the move order
             root_scored = []
+ 
+            # evaluate normal moves
             for mv in moves:
                 child = board.forecast_move(mv)
                 if child is None: continue
-                child.reverse_perspective() 
+                child.reverse_perspective()
+            
+                extra = 0
                 if mv.move_type == MoveType.CARPET:
                     chain_len = _adjacent_primed_chain(
                         board.player_worker.get_location(), board
                     )
                     extra = 3.0 * CARPET_SCORE.get(chain_len, 0)
-                else:
-                    extra = 0
-                root_scored.append((-evaluate(child, rb) + extra, mv))
-                
+            
+                val = -evaluate(child, rb) + extra
+                root_scored.append((val, mv))
+            
+            '''
+            # === ADD: evaluate search move ===
+            if search_move is not None:
+                rat_cell, rat_p, rat_ev = rb.best_cell()
+                search_value = rat_ev * 2   # scale into eval space
+                root_scored.append((search_value, search_move))
+            '''
+            
+            # sort
             root_scored.sort(key=lambda x: x[0], reverse=True)
             moves_ordered = [m for v, m in root_scored] or moves
 
@@ -692,17 +729,22 @@ class PlayerAgent:
                     for mv in moves_ordered:
                         if time.time() > end_time:
                             raise SearchTimeout()
-                            
-                        child = board.forecast_move(mv)
-                        if child is None: continue
-                        
-                        child.reverse_perspective()
-                        val = -self._negamax(child, depth - 1, rb, -beta, -alpha, end_time, self._tt)
-
+                    
+                        # === HANDLE SEARCH DIRECTLY ===
+                        if mv.move_type == MoveType.SEARCH:
+                            rat_cell, rat_p, rat_ev = rb.best_cell()
+                            val = rat_ev * 12
+                        else:
+                            child = board.forecast_move(mv)
+                            if child is None: continue
+                    
+                            child.reverse_perspective()
+                            val = -self._negamax(child, depth - 1, rb, -beta, -alpha, end_time, self._tt)
+                    
                         if val > best_val_this_depth:
                             best_val_this_depth = val
-                            global_best_move = mv  # Safely lock it in!
-
+                            global_best_move = mv
+                    
                         alpha = max(alpha, best_val_this_depth)
                         
             except SearchTimeout:
