@@ -446,7 +446,8 @@ class PlayerAgent:
     def _return_and_track(self, mv):
         """Helper to update our stats before returning a move."""
         if mv is None: 
-            return move.Move.search((random.randint(0, 7), random.randint(0, 7)))
+            rat_cell, rat_p, rat_ev = self.rat_belief.best_cell() if self.rat_belief is not None else ((random.randint(0, 7), random.randint(0, 7)), 0.0, -2.0)
+            return move.Move.search(rat_cell)
         if mv.move_type == MoveType.CARPET:
             self._carpets_made += 1
         elif mv.move_type == MoveType.PRIME:
@@ -597,7 +598,24 @@ class PlayerAgent:
         if turns_left == 1:
             carpet_moves = [m for m in moves if m.move_type == MoveType.CARPET]
             if carpet_moves:
-                return max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
+                best = max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
+                if best is not None and best.roll_length >= 2:
+                    return self._return_and_track(best)
+                
+            if rb is not None:
+                rat_cell, rat_p, rat_ev = rb.best_cell()
+                if rat_ev >= 0.8:
+                    return self._return_and_track(move.Move.search(rat_cell))
+                
+            for mv in moves:
+                if mv.move_type == MoveType.PRIME:
+                    return self._return_and_track(mv)
+                
+            plain_moves = [m for m in moves if m.move_type == MoveType.PLAIN]
+
+            if plain_moves:
+                return self._return_and_track(plain_moves[0])
+            return self._return_and_track(random.choice(moves))
 
         # 2. Opportunistic Search (High confidence only)
         if rb is not None and self._miss_cooldown == 0:
@@ -605,18 +623,18 @@ class PlayerAgent:
             my_score = board.player_worker.get_points()
             opp_score = board.opponent_worker.get_points()
             
-            ev_threshold = 1.3  # Standard: requires ~55% probability
+            ev_threshold = 2  # Standard threshold
             if my_score < opp_score:
-                ev_threshold = 0.8  # Trailing: take more risks (requires ~46% prob)
+                ev_threshold = 1.3  # Trailing: take more risks
             if turns_left <= 10:
-                ev_threshold = max(0.5, ev_threshold - 0.5) # Desperate endgame
+                ev_threshold = ev_threshold - 0.3 # Desperate endgame
 
             if rat_ev >= ev_threshold:
                 my_loc_now = board.player_worker.get_location()
                 my_carpet_now = _max_carpet_potential(my_loc_now, board)
                 
                 # Do not waste a turn searching if we have a prime chain of 4+ points ready
-                if my_carpet_now < 4:
+                if my_carpet_now < 3:
                     return move.Move.search(rat_cell)
                 
         # 3. Iterative-deepening Alpha-Beta Search
@@ -697,7 +715,8 @@ class PlayerAgent:
         if moves: 
             return self._return_and_track(self._greedy(moves, board, rb))
             
-        return move.Move.search((random.randint(0, 7), random.randint(0, 7)))
+        rat_cell, rat_p, rat_ev = rb.best_cell() if rb is not None else ((random.randint(0, 7), random.randint(0, 7)), 0.0, -2.0)
+        return move.Move.search(rat_cell)
 
     # ------------------------------------------------------------------
     # Greedy fallback move selection
