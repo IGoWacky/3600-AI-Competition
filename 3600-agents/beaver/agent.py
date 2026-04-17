@@ -576,11 +576,11 @@ class PlayerAgent:
             my_score = board.player_worker.get_points()
             opp_score = board.opponent_worker.get_points()
             
-            ev_threshold = 1.3  # Standard: requires ~55% probability
+            ev_threshold = 1.9  # Standard: requires ~55% probability
             if my_score < opp_score:
-                ev_threshold = 0.8  # Trailing: take more risks (requires ~46% prob)
+                ev_threshold = 1.55  # Trailing: take more risks (requires ~46% prob)
             if turns_left <= 10:
-                ev_threshold = max(0.5, ev_threshold - 0.5) # Desperate endgame
+                ev_threshold = ev_threshold - 0.3 # Desperate endgame
 
             if rat_ev >= ev_threshold:
                 my_loc_now = board.player_worker.get_location()
