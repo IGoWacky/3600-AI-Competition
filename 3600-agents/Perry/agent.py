@@ -239,7 +239,7 @@ def _future_chain_potential(loc: Tuple[int, int], board_state) -> int:
             if (nx, ny) == enemy_loc or (nx, ny) == player_loc:
                 break
             bit = 1 << (ny * BOARD_SIZE + nx)
-            if (board_state._blocked_mask | board_state._carpet_mask) & bit:
+            if board_state._blocked_mask & bit:
                 break
             length += 1
             nx += dx
@@ -312,7 +312,7 @@ def reachable_space(loc: Tuple[int, int], board_state) -> int:
             if not board_state.is_valid_cell((nx, ny)): continue
             
             bit = 1 << xy_to_cell(nx, ny)
-            if (board_state._blocked_mask | board_state._carpet_mask) & bit:
+            if board_state._blocked_mask & bit:
                 continue
             stack.append((nx, ny))
     return len(visited)
@@ -627,7 +627,7 @@ class PlayerAgent:
             if my_score < opp_score:
                 ev_threshold = 1.6  # Trailing: take more risks
             if turns_left <= 10:
-                ev_threshold = ev_threshold - 1.3 # Desperate endgame
+                ev_threshold = ev_threshold - 0.3 # Desperate endgame
 
             if rat_ev >= ev_threshold:
                 my_loc_now = board.player_worker.get_location()
