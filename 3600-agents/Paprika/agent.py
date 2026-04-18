@@ -743,9 +743,9 @@ class PlayerAgent:
                 ev_threshold = 2.2
 
             if   turns_left <= 5:
-                ev_threshold -= 0.35
+                ev_threshold -= 0.25
             elif turns_left <= 10: 
-                ev_threshold -= 0.2
+                ev_threshold -= 0.15
 
             if rat_ev >= ev_threshold:
                 my_loc_now    = board.player_worker.get_location()
@@ -872,6 +872,11 @@ class PlayerAgent:
                 if chain_now >= 3: score -= 10
                 return score
             return max(prime_moves, key=prime_key)
+        
+        if rb is not None:
+                rat_cell, rat_p, rat_ev = rb.best_cell()
+                if rat_ev >= 1.3:
+                    return self._return_and_track(move.Move.search(rat_cell))
 
         if plain_moves:
             if rb is not None:
