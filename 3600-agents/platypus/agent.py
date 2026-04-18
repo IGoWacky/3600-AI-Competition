@@ -515,7 +515,7 @@ class PlayerAgent:
         self._just_caught_rat = False
         self._tt: dict = {}
         self._last_turns_remaining = None
-        self._is_player_b: bool = False                            # [FIX P-B]
+        self._is_player_b: bool = board.player_worker.is_player_b                            # [FIX P-B]
 
         # Killer move heuristic — 2 slots per ply                     [NEW B]
         self._killers = [[None, None] for _ in range(20)]
