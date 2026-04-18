@@ -85,7 +85,7 @@ class RatBelief:
 
     def predict(self):
         self.belief = self.belief @ self.T
-        self.belief += 0.001 / NUM_CELLS
+        self.belief += 0.0001 / NUM_CELLS
         self._normalize()
 
     def update_noise(self, noise, board_state):
@@ -134,7 +134,7 @@ class RatBelief:
         if found:
             self.belief = self._spawn_dist.copy()
         else:
-            self.belief[xy_to_cell(*searched_pos)] = 0.0
+            self.belief[xy_to_cell(*searched_pos)] = 0.0001
             self._normalize()
 
     def best_cell(self) -> Tuple[Tuple[int, int], float, float]:
@@ -681,14 +681,16 @@ class PlayerAgent:
             opp_score = board.opponent_worker.get_points()
 
             if   my_score < opp_score - 5:
-                ev_threshold = 1.35
+                ev_threshold = 1.55
             elif my_score < opp_score:
-                ev_threshold = 1.6
+                ev_threshold = 1.7
+            elif my_score > opp_score + 5:
+                ev_threshold = 2.2
             else:
                 ev_threshold = 1.9
 
             if   turns_left <= 5:
-                ev_threshold -= 0.45
+                ev_threshold -= 0.35
             elif turns_left <= 10: 
                 ev_threshold -= 0.2
 

@@ -423,32 +423,87 @@ def evaluate(board_state, rat_belief: RatBelief, depth_simulated: int = 0) -> fl
     return score
 
 
+def _primed_run_in_direction(start: Tuple[int,int], dx: int, dy: int,
+                              board_state) -> int:
+    """Count contiguous primed cells from start (exclusive) in direction dx,dy."""
+    count = 0
+    nx, ny = start[0] + dx, start[1] + dy
+    while board_state.is_valid_cell((nx, ny)):
+        bit = 1 << xy_to_cell(nx, ny)
+        if board_state._primed_mask & bit:
+            count += 1; nx += dx; ny += dy
+        else:
+            break
+    return count
+
+
+def get_active_line(loc: Tuple[int, int], board_state) -> Tuple[str, int]:
+    """
+    Returns (axis, length) where axis is 'H', 'V', or None.
+    Only commits to an axis once it reaches 2+ cells.
+    """
+    h_len = (_primed_run_in_direction(loc, -1,  0, board_state) +
+             _primed_run_in_direction(loc,  1,  0, board_state))
+    v_len = (_primed_run_in_direction(loc,  0, -1, board_state) +
+             _primed_run_in_direction(loc,  0,  1, board_state))
+
+    if h_len >= v_len and h_len >= 2:
+        return 'H', h_len
+    if v_len > h_len and v_len >= 2:
+        return 'V', v_len
+    return None, max(h_len, v_len)
+
+
+def prime_axis_penalty(mv, loc: Tuple[int, int], board_state) -> float:
+    """
+    Penalises a prime move that abandons the active line.
+    Penalty scales with how many cells are already committed —
+    the longer the existing line, the more it costs to defect.
+    Returns 0 when there is no committed line yet.
+    """
+    if mv.move_type != MoveType.PRIME:
+        return 0.0
+
+    active_axis, committed_len = get_active_line(loc, board_state)
+    if active_axis is None:
+        return 0.0
+
+    dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
+    move_axis = 'H' if dy == 0 else 'V'
+
+    if move_axis == active_axis:
+        return 0.0  # Staying on the same axis — good
+
+    # Defecting: penalty grows with committed work being abandoned
+    return -8.0 * committed_len
+
+
 # ===========================================================================
 # Move ordering
 # ===========================================================================
 
 def quick_score(mv, board_state, rat_belief: RatBelief) -> float:
-    """Fast static ordering — no forecast_move calls."""
     if mv.move_type == MoveType.CARPET:
         roll_score = CARPET_SCORE.get(mv.roll_length, 0)
-        if roll_score < 0: return -50.0   # never prioritise length-1 roll
+        if roll_score < 0: return -50.0
         return 100.0 + roll_score
 
     if mv.move_type == MoveType.PRIME:
         my_loc = board_state.player_worker.get_location()
         dest   = _move_destination(mv, my_loc)
         dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
+        axis_pen = prime_axis_penalty(mv, my_loc, board_state)  # ADD THIS
         return (10.0
                 + _future_chain_potential(dest, board_state)
-                + _chain_continuation_bonus(dest, dx, dy, board_state))
+                + _chain_continuation_bonus(dest, dx, dy, board_state)
+                + axis_pen)  # ADD THIS
 
     if mv.move_type == MoveType.PLAIN:
-        # Prefer plain moves toward high-potential cells (from doc 10)
         my_loc = board_state.player_worker.get_location()
         dest   = _move_destination(mv, my_loc)
         return 1.0 + 0.5 * _cell_potential(dest[0], dest[1], board_state)
 
-    return -1000.0   # SEARCH excluded from tree
+    return -1000.0
 
 
 # ===========================================================================
@@ -639,6 +694,8 @@ class PlayerAgent:
             if self._turns > 1:
                 rb.predict()
                 rb.predict()
+            elif self._turns == 1 and not board.player_worker.is_player_a:
+                rb.predict()
 
             if noise is not None:
                 rb.update_noise(noise, board)
@@ -657,11 +714,12 @@ class PlayerAgent:
             carpet_moves = [m for m in moves
                             if m.move_type == MoveType.CARPET and m.roll_length >= 2]
             if carpet_moves:
-                return self._return_and_track(
-                    max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1)))
+                best = max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
+                if CARPET_SCORE.get(best.roll_length, 0) >= 2:
+                    return self._return_and_track(best)
             if rb is not None:
                 rat_cell, rat_p, rat_ev = rb.best_cell()
-                if rat_ev >= 0.9:
+                if rat_ev >= 1.3:
                     return self._return_and_track(move.Move.search(rat_cell))
             for mv in moves:
                 if mv.move_type == MoveType.PRIME:
@@ -676,14 +734,16 @@ class PlayerAgent:
             opp_score = board.opponent_worker.get_points()
 
             if   my_score < opp_score - 5:
-                ev_threshold = 1.35
+                ev_threshold = 1.55
             elif my_score < opp_score:
-                ev_threshold = 1.6
+                ev_threshold = 1.75
+            elif my_score > opp_score + 5:
+                ev_threshold = 2.5
             else:
-                ev_threshold = 1.9
+                ev_threshold = 2.2
 
             if   turns_left <= 5:
-                ev_threshold -= 0.45
+                ev_threshold -= 0.35
             elif turns_left <= 10: 
                 ev_threshold -= 0.2
 
@@ -796,7 +856,9 @@ class PlayerAgent:
                 plain_moves.append(mv)
 
         if carpet_moves:
-            return max(carpet_moves, key=lambda x: x[0])[1]
+            best_carpet = max(carpet_moves, key=lambda x: x[0])
+            if best_carpet[0] >= 2:
+                return best_carpet[1]
 
         if prime_moves:
             def prime_key(mv):
@@ -805,7 +867,8 @@ class PlayerAgent:
                 future    = _future_chain_potential(dest, board_state)
                 chain_b   = _chain_continuation_bonus(dest, dx, dy, board_state)
                 chain_now = _adjacent_primed_chain(my_loc, board_state)
-                score     = future + chain_b
+                axis_pen  = prime_axis_penalty(mv, my_loc, board_state)  # ADD THIS
+                score     = future + chain_b + axis_pen  # ADD THIS
                 if chain_now >= 3: score -= 10
                 return score
             return max(prime_moves, key=prime_key)
