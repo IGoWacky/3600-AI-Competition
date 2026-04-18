@@ -644,6 +644,8 @@ class PlayerAgent:
             if self._turns > 1:
                 rb.predict()
                 rb.predict()
+            elif self._turns == 1 and not board.player_worker.is_player_a:
+                rb.predict()
 
             if noise is not None:
                 rb.update_noise(noise, board)
