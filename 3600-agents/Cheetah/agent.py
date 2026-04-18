@@ -61,7 +61,7 @@ def compute_rat_spawn_dist(T: np.ndarray, steps: int = 1000) -> np.ndarray:
     total = dist.sum()
     return dist / total if total > 1e-12 else np.ones(NUM_CELLS) / NUM_CELLS
 
-class SearchTimeout(Exception):
+class timeout(Exception):
     pass
 
 
@@ -368,14 +368,19 @@ def evaluate(board_state, rat_belief: RatBelief, depth_simulated: int = 0) -> fl
     if chain_now >= 3:
         score += 6.0 * CARPET_SCORE.get(chain_now, 0)
 
-    # --- 3. Steal detection: opponent adjacent to our chain (from doc 11) ---
+# PANIC: If the enemy is dangerously close to our chain, plummet our score 
+    # to force the Alpha-Beta tree to roll the carpet NOW before it gets stolen!
     if my_carpet_len >= 2:
-        opp_dist_to_chain = manhattan(opp_loc, _best_carpet_end(my_loc, board_state))
-        steal_prob = max(0.0, 1.0 - opp_dist_to_chain / 5.0)
-        score -= steal_prob * my_carpet
+        opp_dist_to_my_chain = manhattan(opp_loc, _best_carpet_end(my_loc, board_state))
+        if opp_dist_to_my_chain <= 2:
+            score -= 15.0 * CARPET_SCORE.get(my_carpet_len, 0)
 
-    if opp_carpet_len >= 2 and worker_dist <= 4:
-        score -= 8.0 * CARPET_SCORE.get(opp_carpet_len, 0)
+    # HUNT/STEAL: If we are close to the ENEMY'S chain, massively boost our score!
+    # This acts as a magnet, mathematically drawing your bot to block/steal their hard work.
+    if opp_carpet_len >= 2:
+        my_dist_to_opp_chain = manhattan(my_loc, _best_carpet_end(opp_loc, board_state))
+        if my_dist_to_opp_chain <= 2:
+            score += 15.0 * CARPET_SCORE.get(opp_carpet_len, 0)
 
     # --- 4. Future chain potential (carpet squares block, from doc 11) ---
     horizon = max(0.1, turns_left / 40.0)
@@ -510,7 +515,7 @@ class PlayerAgent:
                  tt: dict, depth_simulated: int = 0) -> float:
 
         if time.time() > end_time:
-            raise SearchTimeout()
+            raise timeout()
 
         state_key = (
             board_state._primed_mask, board_state._carpet_mask,
@@ -554,7 +559,7 @@ class PlayerAgent:
 
         for i, mv in enumerate(moves):
             if time.time() > end_time:
-                raise SearchTimeout()
+                raise timeout()
             child = board_state.forecast_move(mv)
             if child is None: continue
             child.reverse_perspective()
@@ -697,14 +702,16 @@ class PlayerAgent:
         if moves:
             self._tt.clear()
             start_time   = time.time()
-            safe_buffer  = 1.0
+            safe_buffer  = 0.5
             usable_time  = max(0.1, time_left() - safe_buffer)
-
-            if   turns_left >= 30: allocated = min(5.0, usable_time / max(1, turns_left - 10))
-            elif turns_left >= 15: allocated = min(3.5, usable_time / 3.0)
-            elif turns_left <= 5:  allocated = min(1.5, usable_time / max(1, turns_left))
-            else:                  allocated = min(2.5, usable_time / max(1, turns_left))
-
+            
+            # Base allocation: evenly divide remaining time by remaining turns
+            base_allocated = usable_time / turns_left
+            
+            # Allow it to borrow up to 1.5x its base time for complex mid-game turns, 
+            # but never let it spend more than 25% of its total bank on a single move.
+            allocated = min(usable_time * 0.25, max(1.0, base_allocated * 1.5))
+            
             end_time = start_time + allocated
 
             # 1-ply root ordering with carpet urgency bonus
@@ -723,7 +730,8 @@ class PlayerAgent:
             root_scored.sort(key=lambda x: x[0], reverse=True)
             moves_ordered    = [m for _, m in root_scored] or moves
             global_best_move = moves_ordered[0]
-
+            
+            completed_best_move = global_best_move
             try:
                 for depth in range(1, 15):
                     if time.time() > end_time:
@@ -731,19 +739,19 @@ class PlayerAgent:
 
                     alpha = -float("inf")
                     beta  =  float("inf")
-                    best_val_this_depth = -float("inf")
-
-                    if global_best_move in moves_ordered:
-                        moves_ordered.remove(global_best_move)
-                        moves_ordered.insert(0, global_best_move)
+                    
+                    # Store all (score, move) tuples for this depth
+                    root_scores = []
 
                     for i, mv in enumerate(moves_ordered):
                         if time.time() > end_time:
-                            raise SearchTimeout()
+                            raise timeout()
+                            
                         child = board.forecast_move(mv)
                         if child is None: continue
                         child.reverse_perspective()
 
+                        # PVS (Principal Variation Search)
                         if i == 0:
                             val = -self._negamax(child, depth-1, rb,
                                                  -beta, -alpha, end_time, self._tt)
@@ -754,15 +762,32 @@ class PlayerAgent:
                                 val = -self._negamax(child, depth-1, rb,
                                                      -beta, -alpha, end_time, self._tt)
 
-                        if val > best_val_this_depth:
-                            best_val_this_depth = val
-                            global_best_move    = mv
-                        alpha = max(alpha, best_val_this_depth)
+                        root_scores.append((val, mv))
+                        alpha = max(alpha, val)
 
-            except SearchTimeout:
+                    # 1. Sort the moves mathematically so the best move is searched first next depth
+                    root_scores.sort(key=lambda x: x[0], reverse=True)
+                    moves_ordered = [m for v, m in root_scores]
+                    
+                    if root_scores:
+                        completed_best_move = root_scores[0][1]
+
+                    # --- 2. EARLY EXIT: THE CONFIDENCE CUTOFF ---
+                    # If we have searched to at least Depth 3, let's look at the scores.
+                    if depth >= 3 and len(root_scores) >= 2:
+                        best_score = root_scores[0][0]
+                        second_score = root_scores[1][0]
+                        
+                        # If our #1 move beats our #2 move by more than 18 points (a massive margin),
+                        # it's a "no-brainer". Stop wasting time and just play it!
+                        if best_score - second_score > 18.0:
+                            break
+
+            except timeout:
+                # We timed out, but completed_best_move safely holds the last fully completed depth!
                 pass
 
-            return self._return_and_track(global_best_move)
+            return self._return_and_track(completed_best_move)
 
         # --- Greedy fallback ---
         if moves:
