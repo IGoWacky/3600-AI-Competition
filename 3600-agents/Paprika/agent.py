@@ -475,7 +475,7 @@ def prime_axis_penalty(mv, loc: Tuple[int, int], board_state) -> float:
         return 0.0  # Staying on the same axis — good
 
     # Defecting: penalty grows with committed work being abandoned
-    return -8.0 * committed_len
+    return -15.0 * committed_len
 
 
 # ===========================================================================
@@ -486,7 +486,7 @@ def quick_score(mv, board_state, rat_belief: RatBelief) -> float:
     if mv.move_type == MoveType.CARPET:
         roll_score = CARPET_SCORE.get(mv.roll_length, 0)
         if roll_score < 0: return -50.0
-        return 100.0 + roll_score
+        return 100.0 + 10 * roll_score
 
     if mv.move_type == MoveType.PRIME:
         my_loc = board_state.player_worker.get_location()
@@ -719,7 +719,7 @@ class PlayerAgent:
                     return self._return_and_track(best)
             if rb is not None:
                 rat_cell, rat_p, rat_ev = rb.best_cell()
-                if rat_ev >= 1.3 if board.player_worker.get_points() >= board.opponent_worker.get_points() else 0.8:
+                if rat_ev >= 1.3 if board.player_worker.get_points() >= board.opponent_worker.get_points() else 1.1:
                     return self._return_and_track(move.Move.search(rat_cell))
             for mv in moves:
                 if mv.move_type == MoveType.PRIME:
@@ -736,13 +736,13 @@ class PlayerAgent:
             opp_score = board.opponent_worker.get_points()
 
             if   my_score < opp_score - 5:
-                ev_threshold = 1.55
+                ev_threshold = 1.65
             elif my_score < opp_score:
-                ev_threshold = 1.75
+                ev_threshold = 1.8
             elif my_score > opp_score + 5:
-                ev_threshold = 2.5
+                ev_threshold = 2.8
             else:
-                ev_threshold = 2.2
+                ev_threshold = 2.4
 
             if   turns_left <= 5:
                 ev_threshold -= 0.25

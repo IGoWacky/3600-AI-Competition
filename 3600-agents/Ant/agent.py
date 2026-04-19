@@ -326,7 +326,10 @@ def evaluate(board_state, rat_belief, depth_simulated: int = 0,
             # Urgency grows as opponent gets closer — steal risk
             opp_dist_to_chain = manhattan(opp_loc, _best_carpet_end(my_loc, board_state))
             steal_urgency = max(1.0, 4.0 - opp_dist_to_chain * 0.5)
-            score += steal_urgency * chain_score * 4.0
+            score += steal_urgency * chain_score * 8.0
+
+    if chain_now >= 4:
+        score -= 6.0 * _future_chain_potential(my_loc, board_state)
 
     # --- 3. Steal detection: opponent adjacent to our carpetable run ---
     if my_carpet_len >= 2:
@@ -433,7 +436,7 @@ def prime_axis_penalty(mv, loc: Tuple[int, int], board_state) -> float:
         return 0.0  # Staying on the same axis — good
 
     # Defecting: penalty grows with committed work being abandoned
-    return -8.0 * committed_len
+    return -15.0 * committed_len
 
 
 # ===========================================================================
@@ -444,13 +447,16 @@ def quick_score(mv, board_state, rat_belief) -> float:
     if mv.move_type == MoveType.CARPET:
         roll_score = CARPET_SCORE.get(mv.roll_length, 0)
         if roll_score < 0: return -50.0
-        return 100.0 + 20 * roll_score
+        return 200.0 + 10 * roll_score
 
     if mv.move_type == MoveType.PRIME:
         my_loc = board_state.player_worker.get_location()
         dest   = _move_destination(mv, my_loc)
         dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
-        axis_pen = prime_axis_penalty(mv, my_loc, board_state) 
+        axis_pen = prime_axis_penalty(mv, my_loc, board_state)
+        chain_len = _adjacent_primed_chain(dest, board_state) 
+        if chain_len >= 3:
+            axis_pen -= 10.0 * CARPET_SCORE.get(chain_len, 0)
         return (10.0
                 + _future_chain_potential(dest, board_state)
                 + _chain_continuation_bonus(dest, dx, dy, board_state)
@@ -638,6 +644,12 @@ class PlayerAgent:
         turns_left = max(1, board.player_worker.turns_left)
         my_loc_now = board.player_worker.get_location()
 
+        chain_len = _adjacent_primed_chain(my_loc_now, board)
+        if chain_len >= 5:
+            carpet_moves = [m for m in moves if m.move_type == MoveType.CARPET]
+            if carpet_moves:
+                return max(carpet_moves, key=lambda m: m.roll_length)
+
         # --- Last few turns: cash out aggressively ---
         if turns_left <= 3:
             carpet_moves = [m for m in moves
@@ -649,7 +661,7 @@ class PlayerAgent:
                     return self._return_and_track(best)
             if rb is not None:
                 rat_cell, rat_p, rat_ev = rb.best_cell()
-                threshold = 1.3 if board.player_worker.get_points() >= board.opponent_worker.get_points() else 0.9
+                threshold = 1.3 if board.player_worker.get_points() >= board.opponent_worker.get_points() else 1.1
                 if rat_ev >= threshold:
                     self._last_pos = my_loc_now
                     return self._return_and_track(move.Move.search(rat_cell))
@@ -669,10 +681,10 @@ class PlayerAgent:
             my_score  = board.player_worker.get_points()
             opp_score = board.opponent_worker.get_points()
 
-            if   my_score < opp_score - 5: ev_threshold = 1.55
-            elif my_score < opp_score:     ev_threshold = 1.75
-            elif my_score > opp_score + 5: ev_threshold = 2.5
-            else:                          ev_threshold = 2.2
+            if   my_score < opp_score - 5: ev_threshold = 1.65
+            elif my_score < opp_score:     ev_threshold = 1.8
+            elif my_score > opp_score + 5: ev_threshold = 2.8
+            else:                          ev_threshold = 2.4
 
             if   turns_left <= 5:  ev_threshold -= 0.25
             elif turns_left <= 10: ev_threshold -= 0.15
