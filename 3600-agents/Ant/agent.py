@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import List, Set, Tuple
+from typing import List, Tuple, Optional
 import random
 import time
 import numpy as np
@@ -24,6 +24,12 @@ NOISE_EMIT = {
 
 DIST_OFFSETS = {-1: 0.12, 0: 0.70, 1: 0.12, 2: 0.06}
 CARPET_SCORE = {1: -1, 2: 2, 3: 4, 4: 6, 5: 10, 6: 15, 7: 21}
+
+ENDGAME_TURNS = 6  # turns at which we switch to cashout mode
+
+
+class SearchTimeout(Exception):
+    pass
 
 
 # ===========================================================================
@@ -54,9 +60,6 @@ def compute_rat_spawn_dist(T: np.ndarray, steps: int = 1000) -> np.ndarray:
     total = dist.sum()
     return dist / total if total > 1e-12 else np.ones(NUM_CELLS) / NUM_CELLS
 
-class SearchTimeout(Exception):
-    pass
-
 
 # ===========================================================================
 # RatBelief — Hidden Markov Model
@@ -65,10 +68,10 @@ class SearchTimeout(Exception):
 class RatBelief:
     """
     Update order per turn:
-      1. update_search()   — apply search result (before rat moved this turn)
-      2. predict() x2      — rat moved before opponent's turn + before ours
-      3. update_noise()    — reweight using noise observation
-      4. update_distance() — reweight using noisy distance sensor
+      1. update_search()  — apply search result
+      2. predict() x2     — rat moves before opponent + before ours
+      3. update_noise()   — reweight by noise observation
+      4. update_distance()— reweight by noisy distance sensor
     """
 
     def __init__(self, transition_matrix):
@@ -103,21 +106,6 @@ class RatBelief:
         self.belief *= lk
         self._normalize()
 
-    def top_cells(self, k: int) -> List[Tuple[float, Tuple[int, int]]]:
-        idxs = np.argsort(self.belief)[::-1][:k]
-        return [(float(self.belief[i]), cell_to_xy(int(i))) for i in idxs]
-
-    def inverse_distance_heat(self, pos: Tuple[int, int]) -> float:
-        top = self.top_cells(8)
-        return sum(p / (1.0 + manhattan(pos, cell)) for p, cell in top)
-
-    def expected_distance(self, pos: Tuple[int, int]) -> float:
-        top = self.top_cells(8)
-        if not top: return 0.0
-        weight = sum(p for p, _ in top)
-        if weight <= 1e-12: return 0.0
-        return sum(p * manhattan(pos, cell) for p, cell in top) / weight
-
     def update_search(self, searched_pos: Tuple[int, int], found: bool):
         if found:
             self.belief = self._spawn_dist.copy()
@@ -129,6 +117,19 @@ class RatBelief:
         idx = int(np.argmax(self.belief))
         p   = float(self.belief[idx])
         return cell_to_xy(idx), p, 6.0 * p - 2.0
+
+    def top_cells(self, k: int) -> List[Tuple[float, Tuple[int, int]]]:
+        idxs = np.argsort(self.belief)[::-1][:k]
+        return [(float(self.belief[i]), cell_to_xy(int(i))) for i in idxs]
+
+    def inverse_distance_heat(self, pos: Tuple[int, int]) -> float:
+        return sum(p / (1.0 + manhattan(pos, cell)) for p, cell in self.top_cells(8))
+
+    def expected_distance(self, pos: Tuple[int, int]) -> float:
+        top = self.top_cells(8)
+        weight = sum(p for p, _ in top)
+        if weight <= 1e-12: return 0.0
+        return sum(p * manhattan(pos, cell) for p, cell in top) / weight
 
     def _normalize(self):
         total = self.belief.sum()
@@ -156,60 +157,91 @@ def _move_destination(mv, current_pos: Tuple[int, int]) -> Tuple[int, int]:
 
 
 # ===========================================================================
-# Heuristic helpers
+# Board geometry helpers
 # ===========================================================================
 
-def _max_carpet_potential(loc, board_state) -> int:
-    """Best immediate carpet roll score from loc."""
-    max_score  = 0
-    enemy_loc  = board_state.opponent_worker.get_location()
+def _run_length_primed(loc: Tuple[int, int], dx: int, dy: int,
+                       board_state) -> int:
+    """Contiguous primed cells from loc (exclusive) in direction dx,dy."""
+    count = 0
+    nx, ny = loc[0] + dx, loc[1] + dy
+    while board_state.is_valid_cell((nx, ny)):
+        bit = 1 << xy_to_cell(nx, ny)
+        if board_state._primed_mask & bit:
+            count += 1; nx += dx; ny += dy
+        else:
+            break
+    return count
+
+
+def _run_length_open(loc: Tuple[int, int], dx: int, dy: int,
+                     board_state) -> int:
+    """Contiguous open (non-blocked, non-carpet) cells from loc in direction dx,dy."""
+    count = 0
+    nx, ny = loc[0] + dx, loc[1] + dy
+    while board_state.is_valid_cell((nx, ny)):
+        bit = 1 << xy_to_cell(nx, ny)
+        if (board_state._blocked_mask | board_state._carpet_mask) & bit:
+            break
+        count += 1; nx += dx; ny += dy
+    return count
+
+
+def _adjacent_primed_chain(loc: Tuple[int, int], board_state) -> int:
+    best = 0
+    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+        best = max(best, _run_length_primed(loc, dx, dy, board_state))
+    return best
+
+
+def _max_carpet_length(loc: Tuple[int, int], board_state) -> int:
+    best       = 0
+    opp_loc    = board_state.opponent_worker.get_location()
     player_loc = board_state.player_worker.get_location()
     for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
         length = 0
         nx, ny = loc[0]+dx, loc[1]+dy
         while board_state.is_valid_cell((nx, ny)):
-            if (nx, ny) in (enemy_loc, player_loc): break
-            bit = 1 << (ny * BOARD_SIZE + nx)
+            if (nx, ny) in (opp_loc, player_loc): break
+            bit = 1 << xy_to_cell(nx, ny)
+            if board_state._primed_mask & bit:
+                length += 1; nx += dx; ny += dy
+            else:
+                break
+        best = max(best, length)
+    return best
+
+
+def _max_carpet_potential(loc: Tuple[int, int], board_state) -> int:
+    best       = 0
+    opp_loc    = board_state.opponent_worker.get_location()
+    player_loc = board_state.player_worker.get_location()
+    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+        length = 0
+        nx, ny = loc[0]+dx, loc[1]+dy
+        while board_state.is_valid_cell((nx, ny)):
+            if (nx, ny) in (opp_loc, player_loc): break
+            bit = 1 << xy_to_cell(nx, ny)
             if board_state._primed_mask & bit:
                 length += 1; nx += dx; ny += dy
             else:
                 break
         if length > 0:
-            max_score = max(max_score, CARPET_SCORE.get(length, 0))
-    return max_score
-
-
-def _max_carpet_length(loc, board_state) -> int:
-    """Raw length of the best carpet roll available."""
-    best_len   = 0
-    enemy_loc  = board_state.opponent_worker.get_location()
-    player_loc = board_state.player_worker.get_location()
-    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
-        length = 0
-        nx, ny = loc[0]+dx, loc[1]+dy
-        while board_state.is_valid_cell((nx, ny)):
-            if (nx, ny) in (enemy_loc, player_loc): break
-            bit = 1 << (ny * BOARD_SIZE + nx)
-            if board_state._primed_mask & bit:
-                length += 1; nx += dx; ny += dy
-            else:
-                break
-        best_len = max(best_len, length)
-    return best_len
+            best = max(best, CARPET_SCORE.get(length, 0))
+    return best
 
 
 def _best_carpet_end(loc: Tuple[int, int], board_state) -> Tuple[int, int]:
-    """End cell of the highest-scoring carpet roll from loc."""
     best_end   = loc
     max_score  = 0
-    enemy_loc  = board_state.opponent_worker.get_location()
+    opp_loc    = board_state.opponent_worker.get_location()
     player_loc = board_state.player_worker.get_location()
     for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
         length = 0
         nx, ny = loc[0]+dx, loc[1]+dy
         while board_state.is_valid_cell((nx, ny)):
-            if (nx, ny) in (enemy_loc, player_loc): break
-            bit = 1 << (ny * BOARD_SIZE + nx)
+            if (nx, ny) in (opp_loc, player_loc): break
+            bit = 1 << xy_to_cell(nx, ny)
             if board_state._primed_mask & bit:
                 length += 1
                 s = CARPET_SCORE.get(length, 0)
@@ -223,19 +255,15 @@ def _best_carpet_end(loc: Tuple[int, int], board_state) -> Tuple[int, int]:
 
 
 def _future_chain_potential(loc: Tuple[int, int], board_state) -> int:
-    """
-    Max carpet score achievable if all open+primed cells in one direction
-    from loc are eventually primed. Carpet squares are treated as blockers.
-    """
     best       = 0
-    enemy_loc  = board_state.opponent_worker.get_location()
+    opp_loc    = board_state.opponent_worker.get_location()
     player_loc = board_state.player_worker.get_location()
     for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
         length = 0
         nx, ny = loc[0]+dx, loc[1]+dy
         while board_state.is_valid_cell((nx, ny)):
-            if (nx, ny) in (enemy_loc, player_loc): break
-            bit = 1 << (ny * BOARD_SIZE + nx)
+            if (nx, ny) in (opp_loc, player_loc): break
+            bit = 1 << xy_to_cell(nx, ny)
             if (board_state._blocked_mask | board_state._carpet_mask) & bit: break
             length += 1; nx += dx; ny += dy
         if length > 0:
@@ -245,35 +273,10 @@ def _future_chain_potential(loc: Tuple[int, int], board_state) -> int:
 
 def _chain_continuation_bonus(dest: Tuple[int, int], dx: int, dy: int,
                                board_state) -> float:
-    count = 0
-    nx, ny = dest[0]+dx, dest[1]+dy
-    while board_state.is_valid_cell((nx, ny)):
-        bit = 1 << (ny * BOARD_SIZE + nx)
-        if board_state._primed_mask & bit:
-            count += 1; nx += dx; ny += dy
-        else:
-            break
-    return count * 3.0
-
-
-def _adjacent_primed_chain(loc, board_state) -> int:
-    """Longest contiguous primed run adjacent to loc in any direction."""
-    best = 0
-    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
-        length = 0
-        nx, ny = loc[0]+dx, loc[1]+dy
-        while board_state.is_valid_cell((nx, ny)):
-            bit = 1 << xy_to_cell(nx, ny)
-            if board_state._primed_mask & bit:
-                length += 1; nx += dx; ny += dy
-            else:
-                break
-        best = max(best, length)
-    return best
+    return _run_length_primed(dest, dx, dy, board_state) * 3.0
 
 
 def _cell_potential(x: int, y: int, board_state) -> int:
-    """Max straight-line run of non-blocked cells through (x,y)."""
     bit = 1 << (y * BOARD_SIZE + x)
     if board_state._blocked_mask & bit: return 0
     best = 0
@@ -289,11 +292,113 @@ def _cell_potential(x: int, y: int, board_state) -> int:
 
 
 # ===========================================================================
-# Static evaluation  (flood fill removed — cell_potential covers it cheaply)
+# Carpet timing model
 # ===========================================================================
 
-def evaluate(board_state, rat_belief, depth_simulated: int = 0,
-             last_pos: Tuple[int, int] | None = None) -> float:
+def _carpet_timing_value(loc: Tuple[int, int], board_state,
+                         turns_left: int) -> float:
+    """
+    Risk-adjusted value of the best carpetable line from loc.
+
+    For each direction:
+    - Computes the immediate cash value (current primed run)
+    - Discounts it by steal risk (opponent proximity to chain end)
+    - Compares against extension value, accounting for turns needed + steal risk
+
+    This replaces the naive 'max carpet score' which always rewards longer chains
+    without penalising the cost of waiting to extend them.
+    """
+    opp_loc    = board_state.opponent_worker.get_location()
+    player_loc = board_state.player_worker.get_location()
+    best_val   = 0.0
+
+    for dx, dy in [(0,1),(0,-1),(1,0),(-1,0)]:
+        # Count primed and total open cells in this direction
+        primed = 0
+        open_  = 0
+        nx, ny = loc[0]+dx, loc[1]+dy
+        counting_primed = True
+        while board_state.is_valid_cell((nx, ny)):
+            if (nx, ny) in (opp_loc, player_loc): break
+            bit = 1 << xy_to_cell(nx, ny)
+            if (board_state._blocked_mask | board_state._carpet_mask) & bit:
+                break
+            open_ += 1
+            if counting_primed:
+                if board_state._primed_mask & bit:
+                    primed += 1
+                else:
+                    counting_primed = False
+            nx += dx; ny += dy
+
+        if open_ == 0:
+            continue
+
+        # Opponent's distance to end of current primed run
+        end_of_primed = (loc[0] + dx * primed, loc[1] + dy * primed)
+        opp_dist      = manhattan(opp_loc, end_of_primed)
+
+        # Steal risk: how likely is opp to intercept before we cash?
+        steal_risk = max(0.0, 1.0 - opp_dist / 5.0)
+
+        # Value if we cash right now
+        immediate_val  = max(0, CARPET_SCORE.get(primed, 0)) if primed >= 1 else 0
+        safe_immediate = immediate_val * (1.0 - steal_risk * 0.65)
+
+        # Value if we extend to full open run
+        if open_ > primed:
+            turns_to_finish = (open_ - primed) + 1  # extra primes + carpet turn
+            if turns_left >= turns_to_finish + 1:
+                extended_val  = CARPET_SCORE.get(min(open_, 7), 0)
+                # Steal risk grows as we take more turns to finish
+                extended_risk = min(0.95, steal_risk + (open_ - primed) * 0.15)
+                safe_extended = extended_val * (1.0 - extended_risk * 0.65)
+                best_val = max(best_val, safe_extended)
+
+        best_val = max(best_val, safe_immediate)
+
+    return best_val
+
+
+# ===========================================================================
+# Primed cell ownership weighting
+# ===========================================================================
+
+def _ownership_weight(cell: Tuple[int, int], my_loc: Tuple[int, int],
+                      opp_loc: Tuple[int, int]) -> float:
+    """
+    Fraction of a primed cell's value that belongs to us.
+    1.0 = only we can realistically reach it, 0.5 = equidistant.
+    """
+    d_me  = manhattan(my_loc, cell)
+    d_opp = manhattan(opp_loc, cell)
+    total = d_me + d_opp
+    if total == 0: return 0.5
+    return d_opp / total  # closer = higher ownership
+
+
+def _owned_primed_value(my_loc: Tuple[int, int], opp_loc: Tuple[int, int],
+                        board_state) -> float:
+    """Sum of primed cells weighted by our ownership of each."""
+    total = 0.0
+    mask  = board_state._primed_mask
+    while mask:
+        lsb   = mask & (-mask)
+        mask ^= lsb
+        idx   = lsb.bit_length() - 1
+        cell  = cell_to_xy(idx)
+        total += _ownership_weight(cell, my_loc, opp_loc)
+    return total
+
+
+# ===========================================================================
+# Static evaluation
+# ===========================================================================
+
+def evaluate(board_state, rat_belief: Optional[RatBelief],
+             depth_simulated: int = 0,
+             last_pos: Optional[Tuple[int, int]] = None) -> float:
+
     my      = board_state.player_worker
     opp     = board_state.opponent_worker
     my_loc  = my.get_location()
@@ -303,169 +408,102 @@ def evaluate(board_state, rat_belief, depth_simulated: int = 0,
     # --- 1. Actual score differential ---
     score = 50.0 * (my.get_points() - opp.get_points())
 
-    # --- 2. Carpet potential ---
-    my_carpet      = _max_carpet_potential(my_loc,  board_state)
-    opp_carpet     = _max_carpet_potential(opp_loc, board_state)
+    # --- 2. Carpet timing value (steal-risk-adjusted) ---
+    my_timing  = _carpet_timing_value(my_loc,  board_state, turns_left)
+    opp_timing = _carpet_timing_value(opp_loc, board_state, turns_left)
+    score += 18.0 * my_timing
+    score -= 18.0 * opp_timing
+
+    # Needed for rat hunting and opponent threat sections below
     my_carpet_len  = _max_carpet_length(my_loc,  board_state)
     opp_carpet_len = _max_carpet_length(opp_loc, board_state)
     worker_dist    = manhattan(my_loc, opp_loc)
 
-    if worker_dist <= 2:   carpet_weight = 4.0
-    elif worker_dist <= 4: carpet_weight = 14.0
-    else:                  carpet_weight = 20.0
+    # --- 3. Opponent threat: penalise their ready chains ---
+    if opp_carpet_len >= 2 and worker_dist <= 5:
+        score -= 7.0 * CARPET_SCORE.get(opp_carpet_len, 0)
 
-    score += carpet_weight * my_carpet
-    score -= carpet_weight * opp_carpet
+    # --- 4. Ownership-weighted primed cell value ---
+    # Rewards building lines only we can cash; penalises shared primed space
+    score += 3.0 * _owned_primed_value(my_loc, opp_loc, board_state)
 
-    # Superlinear bonus for any carpetable run >= 2, scaling with actual score.
-    # This makes the search prefer cashing sooner over extending indefinitely.
-    chain_now = _adjacent_primed_chain(my_loc, board_state)
-    if chain_now >= 2:
-        chain_score = CARPET_SCORE.get(chain_now, 0)
-        if chain_score > 0:
-            # Urgency grows as opponent gets closer — steal risk
-            opp_dist_to_chain = manhattan(opp_loc, _best_carpet_end(my_loc, board_state))
-            steal_urgency = max(1.0, 4.0 - opp_dist_to_chain * 0.5)
-            score += steal_urgency * chain_score * 8.0
+    # --- 5. Future chain potential (discounted by turns remaining) ---
+    horizon    = max(0.1, turns_left / 40.0)
+    my_future  = _future_chain_potential(my_loc,  board_state)
+    opp_future = _future_chain_potential(opp_loc, board_state)
+    score += 3.0 * my_future  * horizon
+    score -= 3.0 * opp_future * horizon
 
-    if chain_now >= 4:
-        score -= 6.0 * _future_chain_potential(my_loc, board_state)
-
-    # --- 3. Steal detection: opponent adjacent to our carpetable run ---
-    if my_carpet_len >= 2:
-        opp_dist_to_chain = manhattan(opp_loc, _best_carpet_end(my_loc, board_state))
-        steal_prob = max(0.0, 1.0 - opp_dist_to_chain / 5.0)
-        score -= steal_prob * my_carpet
-
-    if opp_carpet_len >= 2 and worker_dist <= 4:
-        score -= 8.0 * CARPET_SCORE.get(opp_carpet_len, 0)
-
-    # --- 4. Future chain potential ---
-    horizon = max(0.1, turns_left / 40.0)
-    score += 3.5 * _future_chain_potential(my_loc,  board_state) * horizon
-    score -= 3.5 * _future_chain_potential(opp_loc, board_state) * horizon
-
-    # --- 5. Cell potential ---
+    # --- 6. Cell potential ---
     my_pot  = _cell_potential(my_loc[0],  my_loc[1],  board_state)
     opp_pot = _cell_potential(opp_loc[0], opp_loc[1], board_state)
-    score += 2.5 * my_pot  * horizon
-    score -= 2.5 * opp_pot * horizon
+    score += 2.0 * my_pot  * horizon
+    score -= 2.0 * opp_pot * horizon
 
-    # --- 6. Stranded primed cells penalty ---
+    # --- 7. Stranded primed cells penalty ---
     total_primed = bin(board_state._primed_mask).count('1')
     if turns_left < total_primed:
-        score -= (total_primed - turns_left) * 2.0
+        score -= (total_primed - turns_left) * 2.5
 
-    # --- 7. Rat hunting ---
+    # --- 8. Endgame urgency: holding uncashed runs is costly ---
+    if turns_left <= ENDGAME_TURNS:
+        chain_now = _adjacent_primed_chain(my_loc, board_state)
+        if chain_now >= 2:
+            urgency = (ENDGAME_TURNS - turns_left + 1) / ENDGAME_TURNS
+            score  += urgency * CARPET_SCORE.get(chain_now, 0) * 8.0
+
+    # --- 9. Rat hunting ---
     if rat_belief is not None:
         decay = 0.85 ** depth_simulated
         if my_carpet_len <= 2:
-            my_heat = rat_belief.inverse_distance_heat(my_loc)
-            my_dist = rat_belief.expected_distance(my_loc)
-            score += (7.0 * my_heat - 0.4 * my_dist) * decay
+            score += (7.0 * rat_belief.inverse_distance_heat(my_loc)
+                      - 0.4 * rat_belief.expected_distance(my_loc)) * decay
         if opp_carpet_len <= 2:
-            opp_heat = rat_belief.inverse_distance_heat(opp_loc)
-            opp_dist = rat_belief.expected_distance(opp_loc)
-            score -= (7.0 * opp_heat - 0.4 * opp_dist) * decay
+            score -= (7.0 * rat_belief.inverse_distance_heat(opp_loc)
+                      - 0.4 * rat_belief.expected_distance(opp_loc)) * decay
 
-    # --- 8. Early-game center control ---
-    if turns_left >= 25:
+    # --- 10. Early-game center control ---
+    if turns_left >= 28:
         my_center  = (max(0, 3.5 - abs(my_loc[0]  - 3.5)) +
                       max(0, 3.5 - abs(my_loc[1]  - 3.5)))
         opp_center = (max(0, 3.5 - abs(opp_loc[0] - 3.5)) +
                       max(0, 3.5 - abs(opp_loc[1] - 3.5)))
-        score += 1.0 * (my_center - opp_center)
+        score += 1.2 * (my_center - opp_center)
 
-    # --- 9. Soft oscillation penalty ---
-    # Discourage ending up back where we just were, without hard-blocking it.
+    # --- 11. Soft oscillation penalty ---
     if last_pos is not None and my_loc == last_pos:
-        score -= 5.0
+        score -= 15.0
 
     return score
-
-
-def _primed_run_in_direction(start: Tuple[int,int], dx: int, dy: int,
-                              board_state) -> int:
-    """Count contiguous primed cells from start (exclusive) in direction dx,dy."""
-    count = 0
-    nx, ny = start[0] + dx, start[1] + dy
-    while board_state.is_valid_cell((nx, ny)):
-        bit = 1 << xy_to_cell(nx, ny)
-        if board_state._primed_mask & bit:
-            count += 1; nx += dx; ny += dy
-        else:
-            break
-    return count
-
-
-def get_active_line(loc: Tuple[int, int], board_state) -> Tuple[str, int]:
-    """
-    Returns (axis, length) where axis is 'H', 'V', or None.
-    Only commits to an axis once it reaches 2+ cells.
-    """
-    h_len = (_primed_run_in_direction(loc, -1,  0, board_state) +
-             _primed_run_in_direction(loc,  1,  0, board_state))
-    v_len = (_primed_run_in_direction(loc,  0, -1, board_state) +
-             _primed_run_in_direction(loc,  0,  1, board_state))
-
-    if h_len >= v_len and h_len >= 2:
-        return 'H', h_len
-    if v_len > h_len and v_len >= 2:
-        return 'V', v_len
-    return None, max(h_len, v_len)
-
-
-def prime_axis_penalty(mv, loc: Tuple[int, int], board_state) -> float:
-    """
-    Penalises a prime move that abandons the active line.
-    Penalty scales with how many cells are already committed —
-    the longer the existing line, the more it costs to defect.
-    Returns 0 when there is no committed line yet.
-    """
-    if mv.move_type != MoveType.PRIME:
-        return 0.0
-
-    active_axis, committed_len = get_active_line(loc, board_state)
-    if active_axis is None:
-        return 0.0
-
-    dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
-    move_axis = 'H' if dy == 0 else 'V'
-
-    if move_axis == active_axis:
-        return 0.0  # Staying on the same axis — good
-
-    # Defecting: penalty grows with committed work being abandoned
-    return -15.0 * committed_len
 
 
 # ===========================================================================
 # Move ordering
 # ===========================================================================
 
-def quick_score(mv, board_state, rat_belief) -> float:
+def quick_score(mv, board_state, rat_belief: Optional[RatBelief]) -> float:
+    my_loc = board_state.player_worker.get_location()
+
     if mv.move_type == MoveType.CARPET:
         roll_score = CARPET_SCORE.get(mv.roll_length, 0)
         if roll_score < 0: return -50.0
-        return 200.0 + 10 * roll_score
+        return 100.0 + 8.0 * roll_score
 
     if mv.move_type == MoveType.PRIME:
-        my_loc = board_state.player_worker.get_location()
         dest   = _move_destination(mv, my_loc)
         dx, dy = _DIRECTION_DELTAS.get(mv.direction, (0, 0))
-        axis_pen = prime_axis_penalty(mv, my_loc, board_state)
-        chain_len = _adjacent_primed_chain(dest, board_state) 
-        if chain_len >= 3:
-            axis_pen -= 10.0 * CARPET_SCORE.get(chain_len, 0)
         return (10.0
                 + _future_chain_potential(dest, board_state)
-                + _chain_continuation_bonus(dest, dx, dy, board_state)
-                + axis_pen)
+                + _chain_continuation_bonus(dest, dx, dy, board_state))
 
     if mv.move_type == MoveType.PLAIN:
-        my_loc = board_state.player_worker.get_location()
-        dest   = _move_destination(mv, my_loc)
-        return 1.0 + 0.5 * _cell_potential(dest[0], dest[1], board_state)
+        dest      = _move_destination(mv, my_loc)
+        rat_bonus = 0.0
+        if rat_belief is not None and _max_carpet_length(my_loc, board_state) == 0:
+            cell, p, _ = rat_belief.best_cell()
+            if manhattan(dest, cell) < manhattan(my_loc, cell):
+                rat_bonus = p * 5.0
+        return 1.0 + 0.5 * _cell_potential(dest[0], dest[1], board_state) + rat_bonus
 
     return -1000.0
 
@@ -477,30 +515,29 @@ def quick_score(mv, board_state, rat_belief) -> float:
 class PlayerAgent:
 
     def __init__(self, board, transition_matrix=None, time_left: Callable = None):
-        self.rat_belief = None
+        self.rat_belief: Optional[RatBelief] = None
         self._tm = transition_matrix
 
         if transition_matrix is not None:
             self.rat_belief = RatBelief(transition_matrix)
 
-        self._turns = 0
+        self._turns  = 0
         self._hits   = 0
         self._misses = 0
         self._last_opp_search_turn = -1
         self._last_my_search_turn  = -1
-        self._primes_done    = 0
-        self._carpets_made   = 0
-        self._last_turns_remaining = None
-        self._last_pos: Tuple[int, int] | None = None  # for oscillation detection
+        self._primes_done   = 0
+        self._carpets_made  = 0
+        self._last_turns_remaining: Optional[int] = None
+        self._last_pos: Optional[Tuple[int, int]] = None
 
     # ------------------------------------------------------------------
 
     def commentate(self):
         rats_searched = self._hits + self._misses
-        points_lost   = self._misses * 2
         stats = (f"Primes: {self._primes_done} | Carpets: {self._carpets_made} | "
                  f"Rats Found: {self._hits} | Searched: {rats_searched} | "
-                 f"Pts Lost: {points_lost}")
+                 f"Pts Lost: {self._misses * 2}")
         if self.rat_belief is not None:
             cell, p, ev = self.rat_belief.best_cell()
             return f"Turns: {self._turns} | {stats} | Peak: {cell} p={p:.3f} EV={ev:.2f}"
@@ -508,24 +545,27 @@ class PlayerAgent:
 
     # ------------------------------------------------------------------
 
-    def _return_and_track(self, mv):
+    def _ret(self, mv, my_loc):
+        """Record stats and last position, return move."""
+        self._last_pos = my_loc
         if mv is None:
             rb = self.rat_belief
             rat_cell = (rb.best_cell()[0] if rb is not None
-                        else (random.randint(0,7), random.randint(0,7)))
+                        else (random.randint(0, 7), random.randint(0, 7)))
             return move.Move.search(rat_cell)
         if mv.move_type == MoveType.CARPET: self._carpets_made += 1
         elif mv.move_type == MoveType.PRIME: self._primes_done += 1
         return mv
 
     # ------------------------------------------------------------------
-    # Negamax with alpha-beta + PVS  (TT removed — low hit rate on this board)
+    # Negamax with alpha-beta + PVS
     # ------------------------------------------------------------------
 
-    def _negamax(self, board_state, depth: int, rat_belief,
+    def _negamax(self, board_state, depth: int,
+                 rat_belief: Optional[RatBelief],
                  alpha: float, beta: float, end_time: float,
                  depth_simulated: int = 0,
-                 last_pos: Tuple[int, int] | None = None) -> float:
+                 last_pos: Optional[Tuple[int, int]] = None) -> float:
 
         if time.time() > end_time:
             raise SearchTimeout()
@@ -538,14 +578,11 @@ class PlayerAgent:
             return evaluate(board_state, rat_belief, depth_simulated, last_pos)
 
         moves.sort(key=lambda m: quick_score(m, board_state, rat_belief), reverse=True)
+        if depth <= 1:   moves = moves[:8]
+        elif depth <= 2: moves = moves[:12]
+        else:            moves = moves[:16]
 
-        if depth <= 1:   moves = moves[:6]
-        elif depth <= 2: moves = moves[:10]
-        else:            moves = moves[:12]
-
-        best = -float("inf")
-
-        # The current player's position — children that end here get the oscillation penalty
+        best           = -float("inf")
         cur_player_pos = board_state.player_worker.get_location()
 
         for i, mv in enumerate(moves):
@@ -561,7 +598,6 @@ class PlayerAgent:
                                      depth_simulated+1,
                                      last_pos=cur_player_pos)
             else:
-                # Null-window search (PVS)
                 val = -self._negamax(child, depth-1, rat_belief,
                                      -alpha-1, -alpha, end_time,
                                      depth_simulated+1,
@@ -588,6 +624,7 @@ class PlayerAgent:
     def play(self, board: board.Board, sensor_data: Tuple, time_left: Callable):
         my_turns = board.player_worker.turns_left
 
+        # Detect new game
         if self._last_turns_remaining is None or my_turns > self._last_turns_remaining:
             self._turns = 0
             self._last_turns_remaining = None
@@ -598,6 +635,7 @@ class PlayerAgent:
         self._last_turns_remaining = my_turns - 1
         self._turns += 1
 
+        # Lazy-init rat belief from board if not provided in constructor
         if self.rat_belief is None:
             tm = self._tm
             if tm is None:
@@ -606,7 +644,7 @@ class PlayerAgent:
             if tm is not None:
                 self.rat_belief = RatBelief(tm)
 
-        rb = self.rat_belief
+        rb    = self.rat_belief
         noise, reported_dist = sensor_data
 
         # --- HMM update ---
@@ -618,18 +656,19 @@ class PlayerAgent:
 
             my_search_loc, my_found = board.player_search
             if my_search_loc is not None and self._turns != self._last_my_search_turn:
-                if my_found:
-                    self._hits += 1
-                else:
-                    self._misses += 1
+                if my_found: self._hits += 1
+                else:        self._misses += 1
                 rb.update_search(my_search_loc, my_found)
                 self._last_my_search_turn = self._turns
 
             if self._turns > 1:
                 rb.predict()
+                if not opp_found:
+                    rb.predict()
+            elif self._turns == 1:
                 rb.predict()
-            elif self._turns == 1 and board.player_worker.is_player_b:
-                rb.predict()
+                if board.player_worker.is_player_b:
+                    rb.predict()
 
             if noise is not None:
                 rb.update_noise(noise, board)
@@ -642,70 +681,80 @@ class PlayerAgent:
 
         moves      = list(board.get_valid_moves(exclude_search=True))
         turns_left = max(1, board.player_worker.turns_left)
-        my_loc_now = board.player_worker.get_location()
+        my_loc     = board.player_worker.get_location()
+        my_score   = board.player_worker.get_points()
+        opp_score  = board.opponent_worker.get_points()
 
-        chain_len = _adjacent_primed_chain(my_loc_now, board)
-        if chain_len >= 5:
-            carpet_moves = [m for m in moves if m.move_type == MoveType.CARPET]
-            if carpet_moves:
-                return max(carpet_moves, key=lambda m: m.roll_length)
-
-        # --- Last few turns: cash out aggressively ---
-        if turns_left <= 3:
+        # ---------------------------------------------------------------
+        # ENDGAME PHASE
+        # Cash everything available; stop priming unless we can finish
+        # ---------------------------------------------------------------
+        if turns_left <= ENDGAME_TURNS:
+            # Best available carpet
             carpet_moves = [m for m in moves
-                            if m.move_type == MoveType.CARPET and m.roll_length >= 2]
+                            if m.move_type == MoveType.CARPET
+                            and CARPET_SCORE.get(m.roll_length, -1) >= 2]
             if carpet_moves:
-                best = max(carpet_moves, key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
-                if CARPET_SCORE.get(best.roll_length, 0) >= 2:
-                    self._last_pos = my_loc_now
-                    return self._return_and_track(best)
+                best = max(carpet_moves,
+                           key=lambda m: CARPET_SCORE.get(m.roll_length, -1))
+                return self._ret(best, my_loc)
+
+            # Rat search if high EV (more aggressive when losing)
             if rb is not None:
                 rat_cell, rat_p, rat_ev = rb.best_cell()
-                threshold = 1.3 if board.player_worker.get_points() >= board.opponent_worker.get_points() else 1.1
+                threshold = 0.8 if my_score < opp_score else 1.2
                 if rat_ev >= threshold:
-                    self._last_pos = my_loc_now
-                    return self._return_and_track(move.Move.search(rat_cell))
-            for mv in moves:
-                if mv.move_type == MoveType.PRIME:
-                    self._last_pos = my_loc_now
-                    return self._return_and_track(mv)
-            plain = [m for m in moves if m.move_type == MoveType.PLAIN]
-            if plain:
-                plain.sort(key=lambda m: quick_score(m, board, rb), reverse=True)
-            self._last_pos = my_loc_now
-            return self._return_and_track(plain[0] if plain else random.choice(moves))
-
-        # --- Opportunistic search with dynamic thresholds ---
-        if rb is not None:
-            rat_cell, rat_p, rat_ev = rb.best_cell()
-            my_score  = board.player_worker.get_points()
-            opp_score = board.opponent_worker.get_points()
-
-            if   my_score < opp_score - 5: ev_threshold = 1.65
-            elif my_score < opp_score:     ev_threshold = 1.8
-            elif my_score > opp_score + 5: ev_threshold = 2.8
-            else:                          ev_threshold = 2.4
-
-            if   turns_left <= 5:  ev_threshold -= 0.25
-            elif turns_left <= 10: ev_threshold -= 0.15
-
-            if rat_ev >= ev_threshold:
-                my_carpet_len = _max_carpet_length(my_loc_now, board)
-                if my_carpet_len < 3:
-                    self._last_pos = my_loc_now
+                    self._last_pos = my_loc
                     return move.Move.search(rat_cell)
 
-        # --- Iterative-deepening negamax with PVS ---
+            # Only prime if we have enough turns to carpet the result
+            chain_now   = _adjacent_primed_chain(my_loc, board)
+            prime_moves = [m for m in moves if m.move_type == MoveType.PRIME]
+            if prime_moves and chain_now < turns_left - 1:
+                best_prime = max(prime_moves,
+                                 key=lambda m: quick_score(m, board, rb))
+                return self._ret(best_prime, my_loc)
+
+            # Plain move — move toward best carpet opportunity
+            plain_moves = [m for m in moves if m.move_type == MoveType.PLAIN]
+            if plain_moves:
+                plain_moves.sort(key=lambda m: quick_score(m, board, rb), reverse=True)
+                return self._ret(plain_moves[0], my_loc)
+
+            return self._ret(random.choice(moves) if moves else None, my_loc)
+
+        # ---------------------------------------------------------------
+        # OPPORTUNISTIC RAT SEARCH
+        # Dynamic EV threshold; don't interrupt a live carpet run >= 3
+        # ---------------------------------------------------------------
+        if rb is not None:
+            rat_cell, rat_p, rat_ev = rb.best_cell()
+
+            if   my_score < opp_score - 5: ev_threshold = 1.6
+            elif my_score < opp_score:     ev_threshold = 1.8
+            elif my_score > opp_score + 5: ev_threshold = 2.6
+            else:                          ev_threshold = 2.2
+
+            if   turns_left <= 10: ev_threshold -= 0.2
+            elif turns_left <= 15: ev_threshold -= 0.1
+
+            if rat_ev >= ev_threshold:
+                my_carpet_len = _max_carpet_length(my_loc, board)
+                if my_carpet_len < 3:
+                    self._last_pos = my_loc
+                    return move.Move.search(rat_cell)
+
+        # ---------------------------------------------------------------
+        # ITERATIVE-DEEPENING NEGAMAX WITH PVS
+        # ---------------------------------------------------------------
         if moves:
             start_time  = time.time()
             safe_buffer = 1.0
             usable_time = max(0.1, time_left() - safe_buffer)
+            allocated   = min(5.0, usable_time / max(1, turns_left))
+            end_time    = start_time + allocated
 
-            # Simplified time allocation: single formula
-            allocated = min(6.5, usable_time / max(1, turns_left))
-            end_time  = start_time + allocated
-
-            # 1-ply root ordering with carpet urgency bonus
+            # Root ordering: 1-ply evaluate + carpet urgency bonus
             root_scored = []
             for mv in moves:
                 child = board.forecast_move(mv)
@@ -713,9 +762,10 @@ class PlayerAgent:
                 child.reverse_perspective()
                 extra = 0.0
                 if mv.move_type == MoveType.CARPET:
-                    chain_len = _adjacent_primed_chain(my_loc_now, board)
-                    extra = 3.0 * CARPET_SCORE.get(chain_len, 0)
-                root_scored.append((-evaluate(child, rb, 0, self._last_pos) + extra, mv))
+                    chain_len = _adjacent_primed_chain(my_loc, board)
+                    extra = 4.0 * CARPET_SCORE.get(chain_len, 0)
+                root_scored.append(
+                    (-evaluate(child, rb, 0, self._last_pos) + extra, mv))
 
             root_scored.sort(key=lambda x: x[0], reverse=True)
             moves_ordered    = [m for _, m in root_scored] or moves
@@ -730,6 +780,7 @@ class PlayerAgent:
                     beta  =  float("inf")
                     best_val_this_depth = -float("inf")
 
+                    # Always search previous best first (iterative deepening trick)
                     if global_best_move in moves_ordered:
                         moves_ordered.remove(global_best_move)
                         moves_ordered.insert(0, global_best_move)
@@ -762,16 +813,14 @@ class PlayerAgent:
             except SearchTimeout:
                 pass
 
-            self._last_pos = my_loc_now
-            return self._return_and_track(global_best_move)
+            return self._ret(global_best_move, my_loc)
 
-        # --- Greedy fallback (simplified: just use quick_score) ---
+        # Fallback: greedy
         if moves:
             best_mv = max(moves, key=lambda m: quick_score(m, board, rb))
-            self._last_pos = my_loc_now
-            return self._return_and_track(best_mv)
+            return self._ret(best_mv, my_loc)
 
-        self._last_pos = my_loc_now
+        self._last_pos = my_loc
         rb_cell = (rb.best_cell()[0] if rb is not None
-                   else (random.randint(0,7), random.randint(0,7)))
+                   else (random.randint(0, 7), random.randint(0, 7)))
         return move.Move.search(rb_cell)
