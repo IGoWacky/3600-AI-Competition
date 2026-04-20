@@ -383,7 +383,9 @@ def play_game(
 
         # Rat moves every turn before sampling so the sensor always reflects
         # the rat's current position.
+        print(f"Rat moves from {rat.get_position()}", end="")
         rat.move()
+        print(f" to {rat.get_position()}\n")
         samples = rat.sample(board)
 
         if board.is_player_a_turn:

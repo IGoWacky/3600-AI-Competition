@@ -129,6 +129,7 @@ class Rat:
 
         for _ in range(HEADSTART_MOVES):
             self.move()
+        print(f"Rat spawned at {self.position}.")
 
     def get_position(self) -> Tuple[int, int]:
         return self.position
